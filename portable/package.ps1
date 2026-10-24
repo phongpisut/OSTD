@@ -3,12 +3,15 @@
 $ErrorActionPreference = "Stop"
 $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
 cargo build --release
-$dir = "dist\PaperTranslate"
-Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
+# staged under %TEMP%, so an unzipped copy in dist\ (maybe running) is never touched
+$stage = Join-Path $env:TEMP "paper-translate-package"
+$dir = Join-Path $stage "PaperTranslate"
+Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force $dir | Out-Null
 Copy-Item target\release\paper-translate.exe, target\release\DirectML.dll, portable\README.txt $dir
+New-Item -ItemType Directory -Force dist | Out-Null
 $zip = "dist\PaperTranslate-$version-portable.zip"
 Remove-Item $zip -ErrorAction SilentlyContinue
 Compress-Archive -Path $dir -DestinationPath $zip -CompressionLevel Optimal
-Remove-Item $dir -Recurse -Force
+Remove-Item $stage -Recurse -Force
 "$zip  sha256 $((Get-FileHash $zip -Algorithm SHA256).Hash.ToLower())"
