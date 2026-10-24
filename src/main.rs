@@ -30,8 +30,6 @@ const ORANGE: Color32 = Color32::from_rgb(0xE8, 0x6A, 0x10);
 const ORANGE_SOFT: Color32 = Color32::from_rgb(0xFC, 0xE3, 0xC8);
 const MARKER: Color32 = Color32::from_rgba_premultiplied(0x55, 0x37, 0x14, 0x55); // orange highlighter, ~33%
 const OVERLAY_TITLE: &str = "PaperTranslateOverlay";
-const SUGGEST_TITLE: &str = "PaperTranslateSuggest";
-const SELECT_TITLE: &str = "PaperTranslateSelect";
 
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
 #[serde(default)]
@@ -297,7 +295,7 @@ fn worker(s: S, ctx: Context) {
             }
             // demo mode: hide the overlay from our own capture only, so screenshots and recordings still show it
             let demo: Vec<HWND> = std::env::var_os("PAPER_SHOW_IN_CAPTURE")
-                .map(|_| [OVERLAY_TITLE, SUGGEST_TITLE].iter().filter_map(|t| unsafe { FindWindowW(None, &windows::core::HSTRING::from(*t)) }.ok()).collect())
+                .map(|_| [OVERLAY_TITLE].iter().filter_map(|t| unsafe { FindWindowW(None, &windows::core::HSTRING::from(*t)) }.ok()).collect())
                 .unwrap_or_default();
             for &h in &demo {
                 let _ = unsafe { SetWindowDisplayAffinity(h, WDA_EXCLUDEFROMCAPTURE) };
@@ -473,11 +471,8 @@ struct App {
     hotkeys: GlobalHotKeyManager,
     hotkey: Option<HotKey>,
     overlay: HWND,
-    /// the ★ Suggest window got its no-focus / no-capture styles
-    suggest_styled: bool,
-    /// the box-selection window got its no-focus style
-    select_styled: bool,
-    drag_from: Option<egui::Pos2>,
+    /// the mouse hook (box selection, ★ Suggest clicks) is installed
+    hooked: bool,
     shown: bool,
     opened_at: Option<f64>,
     draft: Config,
@@ -563,9 +558,7 @@ impl App {
             hotkeys: GlobalHotKeyManager::new().expect("hotkey manager"),
             hotkey: None,
             overlay,
-            suggest_styled: false,
-            select_styled: false,
-            drag_from: None,
+            hooked: false,
             shown: false,
             opened_at: None,
             draft: cfg.clone(),
@@ -593,7 +586,7 @@ impl App {
         if let Some([x, y, w, h]) = boundary {
             // a quiet frame so the player knows what is being translated
             let r = Rect::from_min_size(pos2(x as f32, y as f32) / ppp, vec2(w as f32, h as f32) / ppp);
-            ui.painter().rect_stroke(r, 4, Stroke::new(1.5, ORANGE.gamma_multiply(0.7)), StrokeKind::Outside);
+            dashed_rect(ui.painter(), r.expand(1.5), Stroke::new(1.5, ORANGE.gamma_multiply(0.8)));
         }
         let mut animating = false;
         let mut cards = vec![];
@@ -659,91 +652,36 @@ impl App {
         p.add(Shadow { offset: [0, 2], blur: 10, spread: 0, color: Color32::from_black_alpha(50) }.as_shape(pill, 99));
         p.rect(pill, 99, PAPER, Stroke::new(1.0, EDGE), StrokeKind::Inside);
         p.galley(pill.min + vec2(12.0, 6.0), g, INK);
+
+        // ★ Suggest under the pill, part of the see-through overlay; `pick` catches clicks on it
+        let button = Rect::from_center_size(pos2(pill.center().x, pill.bottom() + 24.0), vec2(124.0, 32.0));
+        let hover = {
+            let mut st = pick::STATE.lock().unwrap();
+            st.button = Some([button.min.x * ppp, button.min.y * ppp, button.width() * ppp, button.height() * ppp].map(|v| v as i32));
+            st.hover
+        };
+        let (fill, ink) = if hover { (ORANGE, Color32::WHITE) } else { (PAPER, Color32::from_rgb(0xB3, 0x4A, 0x00)) };
+        p.add(Shadow { offset: [0, 2], blur: 10, spread: 0, color: Color32::from_black_alpha(55) }.as_shape(button, 99));
+        p.rect(button, 99, fill, Stroke::new(1.5, ORANGE), StrokeKind::Inside);
+        p.text(button.center(), egui::Align2::CENTER_CENTER, "★ Suggest", FontId::proportional(15.0), ink);
         if animating {
             ui.ctx().request_repaint();
         }
     }
 
-    /// A small clickable window right under the status pill (the overlay itself lets clicks through to the game).
-    fn suggest_button(&mut self, ctx: &Context) {
-        let size = vec2(140.0, 34.0);
-        let screen_w = unsafe { GetSystemMetrics(SM_CXSCREEN) } as f32 / ctx.pixels_per_point();
-        let at = pos2(screen_w / 2.0 - size.x / 2.0, 48.0);
-        let builder = ViewportBuilder::default()
-            .with_title(SUGGEST_TITLE)
-            .with_decorations(false)
-            .with_transparent(true)
-            .with_always_on_top()
-            .with_taskbar(false)
-            .with_resizable(false)
-            .with_active(false)
-            .with_position(at)
-            .with_inner_size(size);
-        ctx.show_viewport_immediate(ViewportId::from_hash_of("suggest"), builder, |ui, _| {
-            if !self.suggest_styled {
-                // clicking must not take focus from the game, and OCR must not read the button
-                unsafe {
-                    if let Ok(h) = FindWindowW(None, &windows::core::HSTRING::from(SUGGEST_TITLE)) {
-                        no_focus(h);
-                        if std::env::var_os("PAPER_SHOW_IN_CAPTURE").is_none() {
-                            let _ = SetWindowDisplayAffinity(h, WDA_EXCLUDEFROMCAPTURE);
-                        }
-                        self.suggest_styled = true;
-                    }
-                }
-            }
-            let rect = ui.max_rect().shrink(2.0);
-            let r = ui.allocate_rect(rect, Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
-            let (fill, ink) = if r.hovered() { (ORANGE, Color32::WHITE) } else { (PAPER, Color32::from_rgb(0xB3, 0x4A, 0x00)) };
-            let p = ui.painter();
-            p.rect(rect, 99, fill, Stroke::new(1.5, ORANGE), StrokeKind::Inside);
-            p.text(rect.center(), egui::Align2::CENTER_CENTER, "★ Suggest", FontId::proportional(15.0), ink);
-            if r.clicked() {
-                self.s.lock().unwrap().ask();
-            }
-        });
-    }
-
-    /// A full-screen window that takes the mouse for the box selection. Its own window, because switching the
-    /// click-through overlay to take the mouse left it opaque.
-    fn select_window(&mut self, ctx: &Context) {
-        let ppp = ctx.pixels_per_point();
-        let size = unsafe { vec2(GetSystemMetrics(SM_CXSCREEN) as f32, GetSystemMetrics(SM_CYSCREEN) as f32) } / ppp;
-        let builder = ViewportBuilder::default()
-            .with_title(SELECT_TITLE)
-            .with_decorations(false)
-            .with_transparent(true)
-            .with_always_on_top()
-            .with_taskbar(false)
-            .with_resizable(false)
-            .with_active(false)
-            .with_position(pos2(0.0, 0.0))
-            .with_inner_size(size);
-        ctx.show_viewport_immediate(ViewportId::from_hash_of("select"), builder, |ui, _| {
-            if !self.select_styled {
-                if let Ok(h) = unsafe { FindWindowW(None, &windows::core::HSTRING::from(SELECT_TITLE)) } {
-                    no_focus(h);
-                    self.select_styled = true;
-                }
-            }
-            self.select_ui(ui);
-        });
-    }
-
     /// Drag a box around the text to translate; a click without dragging means the whole game window, right-click cancels.
-    fn select_ui(&mut self, ui: &mut Ui) {
-        let ctx = ui.ctx().clone();
-        ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+    /// The mouse comes from `pick`'s hook, so the overlay itself stays click-through and see-through.
+    fn select_ui(&self, ui: &mut Ui) {
+        let ppp = ui.ctx().pixels_per_point();
+        let (down, cur) = {
+            let st = pick::STATE.lock().unwrap();
+            (st.down, st.cur)
+        };
+        let at = |(x, y): (i32, i32)| pos2(x as f32, y as f32) / ppp;
         let screen = ui.max_rect();
-        let resp = ui.allocate_rect(screen, Sense::click_and_drag());
-        if resp.drag_started() {
-            // where the button went down, not where the drag threshold was crossed
-            self.drag_from = ctx.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos());
-        }
-        let sel = self.drag_from.zip(ctx.pointer_latest_pos()).map(|(a, b)| Rect::from_two_pos(a, b));
         let p = ui.painter();
         let dim = Color32::from_black_alpha(110);
-        match sel {
+        match down.map(|d| Rect::from_two_pos(at(d), at(cur))) {
             Some(r) => {
                 // dim everything but the box
                 for side in [
@@ -754,11 +692,15 @@ impl App {
                 ] {
                     p.rect_filled(side, 0, dim);
                 }
-                p.rect_stroke(r, 2, Stroke::new(2.0, ORANGE), StrokeKind::Outside);
-                ctx.request_repaint();
+                dashed_rect(p, r, Stroke::new(2.0, ORANGE));
             }
             None => {
                 p.rect_filled(screen, 0, dim);
+                // crosshair: the cursor itself belongs to the game window underneath
+                let c = at(cur);
+                let line = Stroke::new(1.0, ORANGE.gamma_multiply(0.8));
+                p.line_segment([pos2(screen.min.x, c.y), pos2(screen.max.x, c.y)], line);
+                p.line_segment([pos2(c.x, screen.min.y), pos2(c.x, screen.max.y)], line);
             }
         }
         let g = p.layout_no_wrap(
@@ -769,27 +711,6 @@ impl App {
         let pill = Rect::from_center_size(pos2(screen.center().x, 30.0), g.size() + vec2(28.0, 14.0));
         p.rect(pill, 99, PAPER, Stroke::new(1.0, ORANGE), StrokeKind::Inside);
         p.galley(pill.min + vec2(14.0, 7.0), g, INK);
-
-        let ppp = ctx.pixels_per_point();
-        let finish = |boundary: Option<[i32; 4]>| {
-            let mut g = self.s.lock().unwrap();
-            g.selecting = false;
-            g.boundary = boundary;
-            if !g.active {
-                g.toggle();
-            }
-        };
-        if resp.secondary_clicked() {
-            self.s.lock().unwrap().selecting = false;
-        } else if resp.drag_stopped() {
-            let box_px = sel.filter(|r| r.width() >= 12.0 && r.height() >= 12.0).map(|r| {
-                let r = Rect::from_min_max(r.min * ppp, r.max * ppp);
-                [r.min.x as i32, r.min.y as i32, r.width() as i32, r.height() as i32]
-            });
-            finish(box_px);
-        } else if resp.clicked() {
-            finish(None);
-        }
     }
 
     fn settings_ui(&mut self, ui: &mut Ui, opened: f64) {
@@ -1060,13 +981,47 @@ impl eframe::App for App {
             let g = self.s.lock().unwrap();
             (g.active, g.selecting, g.show_config)
         };
-        if active != self.shown {
-            self.shown = active;
+        let visible = active || selecting;
+        if visible {
+            // winit rebuilds the extended style whenever it changes a flag (e.g. click-through), dropping no-activate
+            no_focus(self.overlay);
+        }
+        if visible != self.hooked {
+            self.hooked = visible;
+            pick::CTX.get_or_init(|| ctx.clone());
+            if visible { pick::start() } else { pick::stop() }
+        }
+        let (done, asked) = {
+            let mut st = pick::STATE.lock().unwrap();
+            if st.selecting != selecting {
+                (st.selecting, st.down, st.done) = (selecting, None, None);
+                ctx.request_repaint();
+            }
+            if !active {
+                st.button = None;
+            }
+            (st.done.take(), std::mem::take(&mut st.ask))
+        };
+        if asked && active {
+            self.s.lock().unwrap().ask();
+            ctx.request_repaint();
+        }
+        if let Some(done) = done.filter(|_| selecting) {
+            let mut g = self.s.lock().unwrap();
+            g.selecting = false;
+            if let Some(boundary) = done {
+                g.boundary = boundary;
+                if !g.active {
+                    g.toggle();
+                }
+            }
+            ctx.request_repaint();
+        }
+        if visible != self.shown {
+            self.shown = visible;
             // Win32 directly: winit's show would activate the window and steal focus from the game
             unsafe {
-                if active {
-                    // winit rewrites the extended style, so no-activate is put back each time
-                    no_focus(self.overlay);
+                if visible {
                     let (w, h) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
                     let _ = SetWindowPos(self.overlay, Some(HWND_TOPMOST), 0, 0, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
                 } else {
@@ -1074,10 +1029,6 @@ impl eframe::App for App {
                 }
             }
             ctx.request_repaint();
-        }
-        if selecting {
-            // the selection window lives inside the root pass, which is skipped while the overlay is hidden
-            ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaintWhileHidden);
         }
         if show_cfg {
             // the settings window lives inside the root pass, which is skipped while the overlay is hidden
@@ -1096,16 +1047,9 @@ impl eframe::App for App {
             (g.active, g.selecting, g.boundary, g.show_config, g.blocks.clone(), g.choice.clone(), status, g.cfg.highlight)
         };
         if selecting {
-            self.select_window(ui.ctx());
-            self.suggest_styled = false;
+            self.select_ui(ui);
         } else if active {
             self.draw_overlay(ui, &blocks, choice.as_ref(), &status, highlight, boundary);
-            self.suggest_button(ui.ctx());
-        } else {
-            self.suggest_styled = false;
-        }
-        if !selecting {
-            (self.select_styled, self.drag_from) = (false, None);
         }
         if !show_cfg {
             self.opened_at = None;
@@ -1140,11 +1084,120 @@ impl eframe::App for App {
     }
 }
 
+fn dashed_rect(p: &egui::Painter, r: Rect, stroke: Stroke) {
+    let corners = [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()];
+    p.extend(egui::Shape::dashed_line(&corners, stroke, 10.0, 6.0));
+}
+
+/// The overlay never takes the mouse: making it hit-testable needs it un-layered, and it is only see-through while layered
+/// (it turned opaque white; a separate window was opaque too). So a low-level hook reads the mouse instead: during box
+/// selection it keeps clicks from the game (moves pass, so the cursor still moves); while translating it only takes
+/// clicks that land on the ★ Suggest button drawn on the overlay.
+mod pick {
+    use std::sync::{Mutex, OnceLock};
+    use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::WindowsAndMessaging::*;
+
+    pub struct State {
+        pub selecting: bool,
+        pub down: Option<(i32, i32)>,
+        pub cur: (i32, i32),
+        /// Some(None) = cancelled; Some(Some(box)) = finished, box None meaning the whole window
+        pub done: Option<Option<Option<[i32; 4]>>>,
+        /// the ★ Suggest button in physical px while translating
+        pub button: Option<[i32; 4]>,
+        pub hover: bool,
+        /// the button was clicked
+        pub ask: bool,
+    }
+
+    pub static STATE: Mutex<State> =
+        Mutex::new(State { selecting: false, down: None, cur: (-1, -1), done: None, button: None, hover: false, ask: false });
+    pub static CTX: OnceLock<eframe::egui::Context> = OnceLock::new();
+    static HOOK: Mutex<isize> = Mutex::new(0);
+
+    unsafe extern "system" fn on_mouse(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
+        if code >= 0 {
+            let p = unsafe { &*(l.0 as *const MSLLHOOKSTRUCT) }.pt;
+            let mut st = STATE.lock().unwrap();
+            let msg = w.0 as u32;
+            if !st.selecting {
+                let on = st.button.is_some_and(|b| p.x >= b[0] && p.x < b[0] + b[2] && p.y >= b[1] && p.y < b[1] + b[3]);
+                let repaint = on != st.hover || (on && msg == WM_LBUTTONUP);
+                st.hover = on;
+                if on && msg == WM_LBUTTONUP {
+                    st.ask = true;
+                }
+                drop(st);
+                // repaint only on changes: mouse moves while playing must not redraw the overlay
+                if let Some(c) = CTX.get().filter(|_| repaint) {
+                    c.request_repaint();
+                }
+                if on && matches!(msg, WM_LBUTTONDOWN | WM_LBUTTONUP) {
+                    return LRESULT(1);
+                }
+                return unsafe { CallNextHookEx(None, code, w, l) };
+            }
+            let swallow = match msg {
+                WM_MOUSEMOVE => {
+                    st.cur = (p.x, p.y);
+                    false
+                }
+                WM_LBUTTONDOWN => {
+                    (st.down, st.cur) = (Some((p.x, p.y)), (p.x, p.y));
+                    true
+                }
+                WM_LBUTTONUP => {
+                    let (x0, y0) = st.down.take().unwrap_or((p.x, p.y));
+                    let r = [x0.min(p.x), y0.min(p.y), (p.x - x0).abs(), (p.y - y0).abs()];
+                    st.done = Some(Some((r[2] >= 12 && r[3] >= 12).then_some(r)));
+                    true
+                }
+                WM_RBUTTONDOWN => true,
+                WM_RBUTTONUP => {
+                    st.done = Some(None);
+                    true
+                }
+                _ => false,
+            };
+            drop(st);
+            if let Some(c) = CTX.get() {
+                c.request_repaint();
+            }
+            if swallow {
+                return LRESULT(1);
+            }
+        }
+        unsafe { CallNextHookEx(None, code, w, l) }
+    }
+
+    pub fn start() {
+        let mut h = HOOK.lock().unwrap();
+        if *h == 0 {
+            let module = unsafe { GetModuleHandleW(None) }.ok().map(Into::into);
+            if let Ok(hook) = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(on_mouse), module, 0) } {
+                *h = hook.0 as isize;
+            }
+        }
+    }
+
+    pub fn stop() {
+        let mut h = HOOK.lock().unwrap();
+        if *h != 0 {
+            let _ = unsafe { UnhookWindowsHookEx(HHOOK(*h as _)) };
+            *h = 0;
+        }
+    }
+}
+
 /// Clicks on this window must not take focus from the game.
 fn no_focus(h: HWND) {
     unsafe {
-        let ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
-        SetWindowLongPtrW(h, GWL_EXSTYLE, ex | (WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0) as isize);
+        let (ex, bits) = (GetWindowLongPtrW(h, GWL_EXSTYLE), (WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0) as isize);
+        if ex & bits != bits {
+            SetWindowLongPtrW(h, GWL_EXSTYLE, ex | bits);
+        }
     }
 }
 

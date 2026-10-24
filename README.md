@@ -33,7 +33,7 @@ After setup the app lives in the tray. Left-click the tray icon for Settings. Th
 - Press it to start, then drag a box (a click means the whole window, right-click cancels).
 - Press it again to stop.
 
-Only the box is read and translated, and a thin orange frame marks it. The box selection and the ★ Suggest button never
+Only the box is read and translated, and a dashed orange frame marks it. The box selection and the ★ Suggest button never
 take focus from the game, and the tray menu has a "Suggest a choice" item too. Automatic suggestions can be turned on in Settings. They are off by default, because outside games
 they can also mark menus and lists.
 
