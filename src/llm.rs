@@ -75,8 +75,9 @@ pub fn pick_choice(options: &[String], scene: &[String], target: &str, confirm: 
         "Text near the options:\n{}\n\nLines:\n{}\n\
          Set kind to what these lines are: \"player_choice\" if the player must pick one of them now (dialogue answers, \
          rewards, upgrades, cards, a yes/no prompt), \"story\" for narration or spoken lines, \"menu\" for game menus or \
-         settings, \"hud\" for status labels. Then set best to the number of the wisest or most beneficial line for the \
-         player (rewards, safety, relationships, story progress) and give a one-sentence reason in {target} in why.",
+         settings, \"hud\" for status labels. Then set best to the number of the best line: the correct answer when \
+         the lines answer a question (trivia, quiz, math, riddle, puzzle), otherwise the wisest or most beneficial line \
+         for the player (rewards, safety, relationships, story progress). Give a one-sentence reason in {target} in why.",
         scene.join("\n"),
         numbered(options)
     );
@@ -107,6 +108,34 @@ fn base64(data: &[u8]) -> String {
         }
     }
     out
+}
+
+/// Answers a question shown without options (trivia, quiz, math, riddle). Returns (answer, reason), or None when the
+/// text does not ask the player anything. `scene` is the other text on screen.
+pub fn answer_question(question: &str, scene: &[String], target: &str) -> Result<Option<(String, String)>, String> {
+    let sys = "You help a player in a video game.";
+    let user = format!(
+        "Other text on screen:\n{}\n\nText: {question}\n\n\
+         Set is_question to true if this text asks the player something that has an answer (trivia, quiz, math, riddle, \
+         puzzle). If true, put the correct answer in answer, short and in {target} (keep names and numbers as they are), \
+         and explain it in one sentence of {target} in why. If false, leave answer and why empty.",
+        scene.join("\n")
+    );
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "is_question": { "type": "boolean" },
+            "answer": { "type": "string", "maxLength": 80 },
+            "why": { "type": "string", "maxLength": 200 }
+        },
+        "required": ["is_question", "answer", "why"], "additionalProperties": false
+    });
+    let out = complete(sys, &user, schema, 220)?;
+    let answer = out["answer"].as_str().unwrap_or("").trim().to_string();
+    if out["is_question"] != json!(true) || answer.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some((answer, out["why"].as_str().unwrap_or("").to_string())))
 }
 
 /// Vision gate: the model looks at the screenshot (BMP) and the candidate options from OCR and says whether the game is
@@ -225,6 +254,17 @@ fn e2e() {
     println!("cards: {cards:?}");
     let unmarked = pick_choice(&s(&["Sure, I'll help you.", "Not today."]), &s(&["Guard", "Will you help me find my sword?"]), "Thai", true);
     println!("unmarked answers: {unmarked:?}");
+    let quiz = pick_choice(&s(&["1. 5", "2. 6", "3. 2"]), &s(&["one + one is"]), "Thai", false);
+    println!("quiz: {quiz:?}");
+    let planet = pick_choice(&s(&["A. Venus", "B. Mars", "C. Jupiter"]), &s(&["Which planet is known as the Red Planet?"]), "Thai", false);
+    println!("planet: {planet:?}");
+    let open = answer_question("What is the capital of France?", &s(&["Quiz Night", "Round 2"]), "Thai");
+    println!("open question: {open:?}");
+    let not_question = answer_question("Welcome back, traveler.", &s(&[]), "Thai");
+    println!("not a question: {not_question:?}");
+    assert_eq!(quiz.unwrap().map(|v| v.0), Some(2));
+    assert_eq!(planet.unwrap().map(|v| v.0), Some(1));
+    assert!(open.unwrap().is_some() && not_question.unwrap().is_none());
     let narration = pick_choice(&s(&["Rain kept falling on the old harbor.", "Nobody came to the docks that night."]), &s(&["Chapter 3"]), "Thai", true);
     println!("narration: {narration:?}");
     let menu = pick_choice(&s(&["Continue", "New Game", "Settings", "Quit"]), &s(&["Version 1.0.4"]), "Thai", true);

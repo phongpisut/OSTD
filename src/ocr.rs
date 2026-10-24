@@ -105,11 +105,17 @@ pub fn recognize(engine: &OcrEngine, bgra: &[u8], w: i32, h: i32) -> Result<Vec<
     run().map_err(|e| e.to_string())
 }
 
-/// Drops icon-noise words and lines without real words (HUD numbers, single glyphs); None when nothing is left.
+/// Drops icon-noise words and single glyphs; None when nothing is left. Numbers stay ("1. 5", "500 gold"): quiz and
+/// shop choices are often only numbers.
 pub fn clean_text(words: &[String]) -> Option<String> {
     let kept: Vec<String> = words.iter().filter(|w| !junk_word(w)).cloned().collect();
     let text = join_words(&kept);
-    (text.chars().filter(|c| c.is_alphabetic()).count() >= 2).then_some(text)
+    (text.chars().filter(|c| c.is_alphanumeric()).count() >= 2).then_some(text)
+}
+
+/// Lines with words get translated; lines of numbers and symbols are shown as they are.
+pub fn has_words(text: &str) -> bool {
+    text.chars().filter(|c| c.is_alphabetic()).count() >= 2
 }
 
 /// OCR of icons and textures gives tokens like "L8fi0WN" or "lIlI1"; real words don't put digits between
@@ -158,20 +164,41 @@ pub fn bmp_thumbnail(bgra: &[u8], w: i32, h: i32, max_w: i32) -> Vec<u8> {
     out
 }
 
-/// A 64x36 grayscale sample of the frame, to notice when nothing on screen changed.
+/// Every second pixel in gray, to notice when nothing on screen changed. Finer than a coarse grid on purpose: on a mostly
+/// plain page, new text fell between 64x36 samples and the old reading was reused.
 pub fn fingerprint(bgra: &[u8], w: i32, h: i32) -> Vec<u8> {
     let (w, h) = (w as usize, h as usize);
-    (0..36 * 64)
-        .map(|i| {
-            let p = ((i / 64) * h / 36 * w + (i % 64) * w / 64) * 4;
-            ((bgra[p] as u32 + bgra[p + 1] as u32 * 2 + bgra[p + 2] as u32) / 4) as u8
-        })
+    (0..h / 2)
+        .flat_map(|y| (0..w / 2).map(move |x| (y * 2 * w + x * 2) * 4))
+        .map(|p| ((bgra[p] as u32 + bgra[p + 1] as u32 * 2 + bgra[p + 2] as u32) / 4) as u8)
         .collect()
 }
 
-/// Same picture within an average of 2 gray levels (video noise, a blinking cursor).
+/// Same picture unless more than a few dozen samples clearly changed (a blinking caret or video noise stays "same",
+/// a new word does not).
 pub fn same_frame(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).map(|(x, y)| x.abs_diff(*y) as usize).sum::<usize>() < a.len() * 2
+    a.len() == b.len() && a.iter().zip(b).filter(|(x, y)| x.abs_diff(**y) > 24).take(40).count() < 40
+}
+
+#[test]
+fn frame_change_detection() {
+    let (w, h) = (200, 100);
+    let plain = vec![255u8; w * h * 4];
+    let mut caret = plain.clone();
+    for y in 10..14 {
+        caret[(y * w + 50) * 4..(y * w + 51) * 4].fill(0); // a 1x4 caret
+    }
+    let mut word = plain.clone();
+    for y in 40..56 {
+        for x in 60..120 {
+            if (x + y) % 3 == 0 {
+                word[(y * w + x) * 4..(y * w + x + 1) * 4].fill(0); // strokes of a word
+            }
+        }
+    }
+    let f = |px: &[u8]| fingerprint(px, w as i32, h as i32);
+    assert!(same_frame(&f(&plain), &f(&caret)));
+    assert!(!same_frame(&f(&plain), &f(&word)));
 }
 
 /// Japanese and Chinese are written without spaces.
@@ -212,6 +239,13 @@ pub fn marker(t: &str) -> bool {
     c.len() == 3 && (matches!(c[0], 'A'..='F' | 'a'..='f' | '1'..='9')) && matches!(c[1], '.' | ')' | ']' | ':') && c[2] == ' '
 }
 
+/// The marker letter of "1.5", "A.Venus", "2)Run": OCR often drops the space after a marker. Alone this could be a decimal
+/// ("3.2"), so it only counts as an option when the markers run in order (see `find_choice`).
+fn loose_marker(t: &str) -> Option<char> {
+    let c: Vec<char> = t.trim_start_matches(['[', '(']).chars().take(3).collect();
+    (c.len() == 3 && matches!(c[0], 'A'..='F' | 'a'..='f' | '1'..='9') && matches!(c[1], '.' | ')') && c[2] != ' ').then_some(c[0])
+}
+
 /// Merge stacked lines of one paragraph (dialogue boxes) so they are translated together. A line joins the block whose
 /// last line sits right above it, wherever that block is in the list: readers return lines column-wise (Windows) or
 /// row-wise across columns (PaddleOCR).
@@ -228,7 +262,9 @@ pub fn blocks(lines: Vec<Line>) -> Vec<Line> {
             let continues = w <= last[2] * 1.3;
             gap > -0.3 * h && gap < 0.9 * h && (left || centered) && same_size && continues
         };
-        match out.iter_mut().rev().find(|(_, last)| fits(last)).filter(|_| !marker(&l.text)) {
+        // a marked line starts an option; two lines that both open with a marker ("1.5" over "2.6") are two options
+        let fits_after = |b: &Line| !marker(&l.text) && !(loose_marker(&l.text).is_some() && loose_marker(&b.text).is_some());
+        match out.iter_mut().rev().find(|(b, last)| fits(last) && fits_after(b)) {
             Some((b, last)) => {
                 b.text = join_words(&[b.text.clone(), l.text]);
                 let (x0, y0) = (b.rect[0].min(x), b.rect[1].min(y));
@@ -256,6 +292,14 @@ pub fn find_choice(b: &[Line]) -> Option<(Vec<Vec<usize>>, bool)> {
     let marked: Vec<usize> = (0..b.len()).filter(|&i| marker(&b[i].text)).collect();
     if (2..=8).contains(&marked.len()) {
         return Some((marked.into_iter().map(|i| vec![i]).collect(), true));
+    }
+    // markers without the space, accepted when they count up from 1 / A in reading order
+    let mut loose: Vec<(usize, char)> = (0..b.len()).filter_map(|i| loose_marker(&b[i].text).map(|m| (i, m))).collect();
+    loose.sort_by(|x, y| b[x.0].rect[1].total_cmp(&b[y.0].rect[1]));
+    let in_order = loose.first().is_some_and(|f| matches!(f.1, '1' | 'A' | 'a'))
+        && loose.windows(2).all(|w| w[1].1 as u32 == w[0].1 as u32 + 1);
+    if in_order && (2..=8).contains(&loose.len()) {
+        return Some((loose.into_iter().map(|(i, _)| vec![i]).collect(), true));
     }
     if let Some(cards) = card_row(b) {
         return Some((cards, true));
@@ -420,6 +464,29 @@ fn thumbnail_is_a_valid_bmp() {
     assert_eq!(&bmp[..2], b"BM");
     assert_eq!(bmp.len(), 54 + 12 * 2); // 4x2 pixels, 12-byte rows
     assert_eq!(bmp[54], 200);
+}
+
+#[test]
+fn quiz_options_without_spaces() {
+    // PaddleOCR reads "1. 5" as "1.5"; tightly stacked, they used to merge into one paragraph
+    let b = blocks(fixture(&[
+        ("one + one is", [520.0, 330.0, 200.0, 28.0]),
+        ("1.5", [540.0, 400.0, 46.0, 26.0]),
+        ("2.6", [540.0, 450.0, 46.0, 26.0]),
+        ("3.2", [540.0, 500.0, 46.0, 26.0]),
+    ]));
+    assert_eq!(b.len(), 4);
+    assert_eq!(find_choice(&b), Some((vec![vec![1], vec![2], vec![3]], true)));
+    // a lone decimal is not an option list
+    assert!(find_choice(&blocks(fixture(&[("Speed 1.5", [0.0, 0.0, 120.0, 20.0]), ("3.2", [0.0, 300.0, 40.0, 20.0])]))).is_none());
+}
+
+#[test]
+fn numbers_are_kept_but_not_translated() {
+    let w = |x: &[&str]| x.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    assert_eq!(clean_text(&w(&["1.", "5"])).as_deref(), Some("1. 5"));
+    assert_eq!(clean_text(&w(&["4"])), None);
+    assert!(!has_words("1. 5") && has_words("one + one is"));
 }
 
 #[test]

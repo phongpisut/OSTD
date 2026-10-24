@@ -95,7 +95,9 @@ struct Block {
 #[derive(Clone)]
 struct ChoiceView {
     window: [f32; 4],
-    best: [f32; 4],
+    /// the starred option; None for an answer to a question
+    best: Option<[f32; 4]>,
+    head: &'static str,
     why: String,
     born: Instant,
 }
@@ -261,6 +263,8 @@ fn worker(s: S, ctx: Context) {
     let mut cache: HashMap<String, String> = HashMap::new();
     // option texts of the last choice window → the decision model's verdict (None = not a real choice)
     let mut picked: Option<(Vec<String>, Option<(usize, String)>)> = None;
+    // question text → its answer, for questions on screen without options
+    let mut answered: Option<(String, String)> = None;
     let mut reader: Option<(String, Reader)> = None;
     let mut cache_key = String::new();
     let mut last_frame: (Vec<u8>, Vec<ocr::Line>) = (vec![], vec![]);
@@ -270,6 +274,7 @@ fn worker(s: S, ctx: Context) {
             (g.active, g.ready, g.vision, g.ask_choice, g.boundary, g.cfg.clone())
         };
         if !active {
+            last_frame = (vec![], vec![]); // starting again must read the screen again
             thread::sleep(Duration::from_millis(100));
             continue;
         }
@@ -277,7 +282,7 @@ fn worker(s: S, ctx: Context) {
         let mut scan = || -> Result<(), String> {
             let key = format!("{}|{}", cfg.target_lang, cfg.highlight);
             if key != cache_key || cache.len() > 2000 {
-                (cache, picked, cache_key) = (HashMap::new(), None, key);
+                (cache, picked, answered, cache_key) = (HashMap::new(), None, None, key);
             }
             let dir = setup::paddle_dir(&cfg.model_path);
             let use_paddle = cfg.ocr_engine == "paddle" && setup::paddle_ready(&dir);
@@ -331,14 +336,11 @@ fn worker(s: S, ctx: Context) {
             };
             let blocks = ocr::blocks(lines);
             let (choice, strong) = match ocr::find_choice(&blocks) {
+                // an unmarked list holding a question is the prompt plus text, not options: answer it instead
+                Some((c, false)) if c.iter().flatten().any(|&i| blocks[i].text.contains(['?', '？'])) => (None, false),
                 Some((c, strong)) => (Some(c), strong),
                 None => (None, false),
             };
-            if ask && choice.is_none() {
-                let mut g = s.lock().unwrap();
-                g.ask_choice = false;
-                g.notice = Some(("No choices found on this screen".into(), Instant::now()));
-            }
             let in_choice = |r: &[usize]| choice.iter().flatten().flatten().any(|i| r.contains(i));
             let max_h = |r: &[usize]| r.iter().map(|&i| blocks[i].line_h).fold(0.0, f32::max);
             let mut regions = ocr::regions(&blocks, choice.as_deref());
@@ -347,6 +349,9 @@ fn worker(s: S, ctx: Context) {
             for region in &regions {
                 let mut new: Vec<String> = vec![];
                 for &i in region {
+                    if !ocr::has_words(&blocks[i].text) {
+                        continue; // numbers need no translation
+                    }
                     if !cache.contains_key(&blocks[i].text) && !new.contains(&blocks[i].text) {
                         new.push(blocks[i].text.clone());
                     }
@@ -362,7 +367,7 @@ fn worker(s: S, ctx: Context) {
                     for (src, t) in chunk.iter().zip(tr) {
                         cache.insert(src.clone(), t);
                     }
-                    if !publish(&s, &blocks, &cache, choice_view(&blocks, choice.as_deref(), &picked)) {
+                    if !publish(&s, &blocks, &cache, suggestion(&blocks, choice.as_deref(), &picked, &answered)) {
                         return Ok(()); // turned off mid-scan
                     }
                     ctx.request_repaint();
@@ -396,7 +401,30 @@ fn worker(s: S, ctx: Context) {
                     }
                 }
             }
-            publish(&s, &blocks, &cache, choice_view(&blocks, choice.as_deref(), &picked));
+            // asked with no options on screen: answer the question instead (trivia, quiz, riddle)
+            if ask && choice.is_none() {
+                let question = (blocks.iter().filter(|l| l.text.contains('?') || l.text.contains('？')))
+                    .max_by(|a, b| a.line_h.total_cmp(&b.line_h))
+                    .or_else(|| blocks.iter().filter(|l| ocr::has_words(&l.text)).max_by(|a, b| a.line_h.total_cmp(&b.line_h)));
+                let reply = match question {
+                    Some(q) => {
+                        s.lock().unwrap().status = "Thinking…".into();
+                        ctx.request_repaint();
+                        let mut near: Vec<&ocr::Line> = blocks.iter().filter(|l| l.text != q.text).collect();
+                        near.sort_by(|a, b| dist(a.rect, q.rect).total_cmp(&dist(b.rect, q.rect)));
+                        let scene: Vec<String> = near.iter().take(4).map(|l| l.text.clone()).collect();
+                        llm::answer_question(&q.text, &scene, &cfg.target_lang)?.map(|(a, why)| (q.text.clone(), format!("{a}\n{why}")))
+                    }
+                    None => None,
+                };
+                let mut g = s.lock().unwrap();
+                g.ask_choice = false;
+                match reply {
+                    Some(r) => answered = Some(r),
+                    None => g.notice = Some(("No choices or questions found on this screen".into(), Instant::now())),
+                }
+            }
+            publish(&s, &blocks, &cache, suggestion(&blocks, choice.as_deref(), &picked, &answered));
             Ok(())
         };
         if let Err(e) = scan() {
@@ -415,6 +443,7 @@ fn publish(s: &S, lines: &[ocr::Line], cache: &HashMap<String, String>, choice: 
     }
     let blocks: Vec<Block> = lines
         .iter()
+        .filter(|l| ocr::has_words(&l.text))
         .filter_map(|l| {
             Some(Block {
                 text: cache.get(&l.text)?.clone(),
@@ -458,10 +487,22 @@ fn choice_view(b: &[ocr::Line], choice: Option<&[Vec<usize>]>, picked: &Option<(
     let (k, why) = verdict.as_ref()?;
     (*options == option_texts(b, c)).then(|| ChoiceView {
         window: union(c.iter().flatten().map(|&i| b[i].rect)),
-        best: union(c[*k].iter().map(|&i| b[i].rect)),
+        best: Some(union(c[*k].iter().map(|&i| b[i].rect))),
+        head: "Suggested choice",
         why: why.replace("**", ""),
         born: Instant::now(),
     })
+}
+
+/// An answer to a question with no options, shown while that question is still on screen.
+fn answer_view(b: &[ocr::Line], answered: &Option<(String, String)>) -> Option<ChoiceView> {
+    let (question, body) = answered.as_ref()?;
+    let line = b.iter().find(|l| l.text == *question)?;
+    Some(ChoiceView { window: line.rect, best: None, head: "Answer", why: body.replace("**", ""), born: Instant::now() })
+}
+
+fn suggestion(b: &[ocr::Line], choice: Option<&[Vec<usize>]>, picked: &Option<(Vec<String>, Option<(usize, String)>)>, answered: &Option<(String, String)>) -> Option<ChoiceView> {
+    choice_view(b, choice, picked).or_else(|| answer_view(b, answered))
 }
 
 struct App {
@@ -618,14 +659,16 @@ impl App {
             let win = pts(c.window).expand(16.0 + (1.0 - t) * 10.0);
             p.rect_stroke(win, 16, Stroke::new(9.0, ORANGE.gamma_multiply(0.2)), StrokeKind::Outside);
             p.rect_stroke(win, 16, Stroke::new(2.0, ORANGE), StrokeKind::Outside);
-            let best = pts(c.best).expand(9.0);
-            p.rect_stroke(best, 10, Stroke::new(3.0, ORANGE), StrokeKind::Outside);
-            let star = best.right_top();
-            p.circle_filled(star, 12.0, ORANGE);
-            p.text(star, egui::Align2::CENTER_CENTER, "★", FontId::proportional(14.0), Color32::WHITE);
+            if let Some(best) = c.best {
+                let best = pts(best).expand(9.0);
+                p.rect_stroke(best, 10, Stroke::new(3.0, ORANGE), StrokeKind::Outside);
+                let star = best.right_top();
+                p.circle_filled(star, 12.0, ORANGE);
+                p.text(star, egui::Align2::CENTER_CENTER, "★", FontId::proportional(14.0), Color32::WHITE);
+            }
             // short reason on a paper note above the window (below it when there is no room)
             let width = 340.0;
-            let head = p.layout_no_wrap("Suggested choice".into(), FontId::proportional(12.0), ORANGE);
+            let head = p.layout_no_wrap(c.head.into(), FontId::proportional(12.0), ORANGE);
             let body = p.layout(c.why.clone(), FontId::proportional(15.0), INK, width - 30.0);
             let (hh, size) = (head.size().y, vec2(width, head.size().y + body.size().y + 20.0));
             // above the window, else beside or below it: the first spot that covers no translation

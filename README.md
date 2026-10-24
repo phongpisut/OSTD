@@ -4,7 +4,8 @@ Live on-screen translation overlay for Windows 11 games and apps. Press a hotkey
 window is covered by paper-style cards in your language. Names, items and key terms are highlighted in orange.
 Press **Ctrl+Shift+T** and drag a box around the text you want translated, or just click to translate the whole game
 window. When the game asks you to pick (A/B/C answers, ①②③, a roguelike reward screen), click **★ Suggest** under the
-status pill. The choice window gets an orange outline, the best option a ★, and a short reason appears next to it.
+status pill. The choice window gets an orange outline, the best option a ★, and a short reason appears next to it. Quiz,
+trivia and math choices get the correct answer, and a question with no options gets its answer in a note next to it.
 
 Reads English, Japanese, Chinese, Korean, Russian (Cyrillic) and Thai games, switching readers automatically, and
 translates into any language (Thai, Japanese, English…). Everything
@@ -43,14 +44,17 @@ they can also mark menus and lists.
 2. **Read text** with PaddleOCR PP-OCRv6 medium on the GPU (ONNX Runtime + DirectML), or Windows OCR on PCs with
    less VRAM. PP-OCRv6 reads Chinese, Japanese and Latin scripts. Some lines it can't read: it returns few letters
    for its box, or a low confidence. Those lines are re-read on the CPU by small PP-OCRv5 Korean, Cyrillic and Thai
-   readers (8–13 MB each, 2 threads), and a reader only takes over a line written in its own script. Icon noise is
-   dropped, and Japanese/Chinese words are joined without spaces.
+   readers (8–13 MB each, 2 threads), and a reader only takes over a line written in its own script. Icon noise and
+   single glyphs are dropped, number-only lines (such as "1. 5" or "500") are kept for choices but not translated, and
+   Japanese/Chinese words are joined without spaces.
 3. **Context boundaries**: lines are merged into paragraphs, then into regions (a dialogue box, a panel, a choice
    window). Each region is translated in its own request, so the model only sees text that belongs together.
    Translations are cached.
 4. **Choices**: the layout proposes candidates. Strong evidence is `A.` / `1)` / `①` / `▶` markers or 2–5 evenly
    spaced cards. A plain stacked list counts only when a question is nearby or the lines read like replies.
-5. **Decision**: when you click ★ Suggest, the text prompt picks the best option and writes the reason. With automatic
+5. **Decision**: when you click ★ Suggest, the text prompt picks the best option and writes the reason. For quiz, trivia,
+   math or riddle questions, the best option is the correct answer. With no options on screen, the question is answered
+   directly: the line with a "?", or else the most prominent line. With automatic
    suggestions on, Gemma 4's vision first checks the screenshot plus the candidate options to confirm the game is
    really asking for a pick.
 
