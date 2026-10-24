@@ -1,6 +1,6 @@
 <!-- Per-user MSI (no admin): the exe, DirectML.dll (GPU runtime for PaddleOCR), a Start Menu shortcut and an uninstaller.
      Models, llama.cpp and settings are downloaded or created by the app under %APPDATA% / %LOCALAPPDATA%.
-     Build: wix build installer/PaperTranslate.wxs -d Version=0.2.0 -arch x64 -o dist/PaperTranslate-0.2.0-Setup.msi
+     Build: wix build installer/PaperTranslate.wxs -d Version=0.3.0 -arch x64 -o dist/PaperTranslate-0.3.0-Setup.msi
      (-d BinDir=<folder> if the release build is not in target/release) -->
 <?ifndef BinDir ?>
 <?define BinDir = "target/release" ?>

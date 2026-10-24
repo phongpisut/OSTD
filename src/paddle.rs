@@ -5,20 +5,59 @@ use crate::ocr::Line;
 use ort::{ep, session::Session, value::Tensor};
 use std::path::Path;
 
-/// (Hugging Face repo, file, saved as) — the official Paddle ONNX exports, Apache-2.0.
-pub const FILES: [(&str, &str, &str); 3] = [
+/// (Hugging Face repo, file, saved as) — the official Paddle ONNX exports, Apache-2.0. The first three are required.
+pub const FILES: [(&str, &str, &str); 9] = [
     ("PaddlePaddle/PP-OCRv6_medium_det_onnx", "inference.onnx", "ppocr-v6-det.onnx"),
     ("PaddlePaddle/PP-OCRv6_medium_rec_onnx", "inference.onnx", "ppocr-v6-rec.onnx"),
     ("PaddlePaddle/PP-OCRv6_medium_rec_onnx", "inference.yml", "ppocr-v6-rec.yml"),
+    // small per-script readers (PP-OCRv5 mobile, 8–13 MB) for what PP-OCRv6 cannot read
+    ("PaddlePaddle/korean_PP-OCRv5_mobile_rec_onnx", "inference.onnx", "ppocr-v5-korean-rec.onnx"),
+    ("PaddlePaddle/korean_PP-OCRv5_mobile_rec_onnx", "inference.yml", "ppocr-v5-korean-rec.yml"),
+    ("PaddlePaddle/eslav_PP-OCRv5_mobile_rec_onnx", "inference.onnx", "ppocr-v5-eslav-rec.onnx"),
+    ("PaddlePaddle/eslav_PP-OCRv5_mobile_rec_onnx", "inference.yml", "ppocr-v5-eslav-rec.yml"),
+    ("PaddlePaddle/th_PP-OCRv5_mobile_rec_onnx", "inference.onnx", "ppocr-v5-th-rec.onnx"),
+    ("PaddlePaddle/th_PP-OCRv5_mobile_rec_onnx", "inference.yml", "ppocr-v5-th-rec.yml"),
 ];
+
+/// PP-OCRv6 reads Chinese, Japanese, English/Latin and Greek; these cover the scripts it has no characters for.
+const SCRIPTS: [(&str, &str); 3] = [("korean", "Korean"), ("eslav", "Cyrillic"), ("th", "Thai")];
+
+/// A small reader only takes a line over when its reading is in its own script (they all know Latin letters too).
+fn own_script(name: &str, c: char) -> bool {
+    match name {
+        "Korean" => matches!(c, '\u{AC00}'..='\u{D7A3}' | '\u{1100}'..='\u{11FF}' | '\u{3130}'..='\u{318F}'),
+        "Cyrillic" => matches!(c, '\u{0400}'..='\u{04FF}'),
+        "Thai" => matches!(c, '\u{0E00}'..='\u{0E7F}'),
+        _ => false,
+    }
+}
+
+/// Below this confidence the main reader may have met a script it does not know.
+const UNSURE: f32 = 0.9;
+
+/// A reader that does not know a script emits a few dots and spaces, often with high confidence, so a reading also
+/// needs enough letters for its box: real lines give ≥ ~0.9 letters per box height of width (CJK ~1, English ~1.8),
+/// garbage like "    ." or "A. Qu" stays below 0.6.
+fn enough_letters(text: &str, b: &[f32; 4]) -> bool {
+    text.chars().filter(|c| c.is_alphanumeric()).count() as f32 >= 0.6 * b[2] / b[3].max(1.0)
+}
+
+struct Reader {
+    name: &'static str,
+    session: Session,
+    /// index 0 is the CTC blank
+    chars: Vec<String>,
+}
 
 pub struct Paddle {
     _env: ort::environment::Environment,
     det: Session,
-    rec: Session,
-    /// index 0 is the CTC blank
-    chars: Vec<String>,
+    rec: Reader,
+    /// per-script readers on the CPU, consulted only for lines the main reader is unsure about
+    scripts: Vec<Reader>,
     pub gpu: bool,
+    /// scripts the small readers took over on the last frame, for Settings ("Korean", …)
+    pub last_scripts: Vec<&'static str>,
 }
 
 fn err(e: impl std::fmt::Display) -> String {
@@ -42,17 +81,53 @@ impl Paddle {
             (Ok(d), Ok(r)) => (d, r, true),
             _ => (open(FILES[0].2, false)?, open(FILES[1].2, false)?, false),
         };
-        let yml = std::fs::read_to_string(dir.join(FILES[2].2)).map_err(err)?;
-        let mut chars = vec![String::new()];
-        chars.extend(read_dict(&yml));
-        Ok(Self { _env: env, det, rec, chars, gpu })
+        let dict = |file: &str| -> Result<Vec<String>, String> {
+            let yml = std::fs::read_to_string(dir.join(file)).map_err(err)?;
+            Ok(std::iter::once(String::new()).chain(read_dict(&yml)).collect())
+        };
+        let rec = Reader { name: "PP-OCRv6", session: rec, chars: dict(FILES[2].2)? };
+        // CPU with 2 threads: a few short lines take milliseconds, and the game keeps its cores and VRAM
+        let scripts = SCRIPTS
+            .iter()
+            .filter_map(|&(tag, name)| {
+                let model = format!("ppocr-v5-{tag}-rec");
+                let session = Session::builder(&env).and_then(|b| b.with_intra_threads(2).map_err(Into::into));
+                let session = session.ok()?.commit_from_file(dir.join(format!("{model}.onnx"))).ok()?;
+                Some(Reader { name, session, chars: dict(&format!("{model}.yml")).ok()? })
+            })
+            .collect();
+        Ok(Self { _env: env, det, rec, scripts, gpu, last_scripts: vec![] })
     }
 
     pub fn recognize(&mut self, bgra: &[u8], w: i32, h: i32) -> Result<Vec<Line>, String> {
         let (w, h) = (w as usize, h as usize);
         let boxes = self.detect(bgra, w, h)?;
         let crops: Vec<[f32; 4]> = boxes.iter().map(|b| b.0).collect();
-        let texts = self.read(bgra, w, &crops)?;
+        let mut texts = read(&mut self.rec, bgra, w, &crops)?;
+        // auto language: lines the main reader is unsure about get read again by each per-script reader;
+        // the most confident reading wins, line by line (a Korean dialogue with an English HUD reads both right)
+        let sure = |t: &(String, f32), b: &[f32; 4]| t.1 >= UNSURE && enough_letters(&t.0, b);
+        // the script that won last frame goes first, so a Korean game mostly runs just the Korean reader
+        let last = std::mem::take(&mut self.last_scripts);
+        self.scripts.sort_by_key(|r| !last.contains(&r.name));
+        for r in &mut self.scripts {
+            let unsure: Vec<usize> = (0..texts.len()).filter(|&i| !sure(&texts[i], &crops[i])).collect();
+            if unsure.is_empty() {
+                break;
+            }
+            let unsure_crops: Vec<[f32; 4]> = unsure.iter().map(|&i| crops[i]).collect();
+            for (k, alt) in read(r, bgra, w, &unsure_crops)?.into_iter().enumerate() {
+                let i = unsure[k];
+                let full = |t: &str| enough_letters(t, &crops[i]);
+                let native = alt.0.chars().any(|c| own_script(r.name, c));
+                if native && full(&alt.0) && (!full(&texts[i].0) || alt.1 > texts[i].1 + 0.05) {
+                    texts[i] = alt;
+                    if !self.last_scripts.contains(&r.name) {
+                        self.last_scripts.push(r.name);
+                    }
+                }
+            }
+        }
         Ok(boxes
             .into_iter()
             .zip(texts)
@@ -137,44 +212,45 @@ impl Paddle {
         Ok(boxes)
     }
 
-    /// CTC recognition of each box, batched by aspect ratio like Paddle (height 48, width ≥ 320).
-    fn read(&mut self, bgra: &[u8], w: usize, boxes: &[[f32; 4]]) -> Result<Vec<(String, f32)>, String> {
-        let mut out = vec![(String::new(), 0.0); boxes.len()];
-        let ratio = |b: &[f32; 4]| b[2] / b[3].max(1.0);
-        let mut order: Vec<usize> = (0..boxes.len()).collect();
-        order.sort_by(|&a, &b| ratio(&boxes[a]).total_cmp(&ratio(&boxes[b])));
-        for batch in order.chunks(6) {
-            let max_ratio = batch.iter().map(|&i| ratio(&boxes[i])).fold(320.0 / 48.0, f32::max);
-            let img_w = (48.0 * max_ratio).ceil() as usize;
-            let mut data = vec![0f32; batch.len() * 3 * 48 * img_w];
-            for (k, &i) in batch.iter().enumerate() {
-                let b = boxes[i];
-                let crop = [b[0] as usize, b[1] as usize, (b[2] as usize).max(1), (b[3] as usize).max(1)];
-                let dw = ((48.0 * ratio(&b)).ceil() as usize).clamp(1, img_w);
-                to_chw(bgra, w, crop, dw, 48, &mut data[k * 3 * 48 * img_w..(k + 1) * 3 * 48 * img_w], img_w);
-            }
-            let outputs = self.rec.run(ort::inputs![Tensor::from_array(([batch.len(), 3, 48, img_w], data)).map_err(err)?]).map_err(err)?;
-            let (shape, probs) = outputs[0].try_extract_tensor::<f32>().map_err(err)?;
-            let (steps, classes) = (shape[1] as usize, shape[2] as usize);
-            if classes == self.chars.len() + 1 && self.chars.last().is_some_and(|c| c != " ") {
-                self.chars.push(" ".into()); // Paddle appends a space class after the dictionary
-            }
-            for (k, &i) in batch.iter().enumerate() {
-                let (mut text, mut sum, mut n, mut last) = (String::new(), 0.0, 0, 0);
-                for t in 0..steps {
-                    let row = &probs[(k * steps + t) * classes..(k * steps + t + 1) * classes];
-                    let (best, p) = row.iter().enumerate().fold((0, f32::MIN), |m, (j, &p)| if p > m.1 { (j, p) } else { m });
-                    if best != 0 && best != last {
-                        text.push_str(self.chars.get(best).map_or("", |s| s.as_str()));
-                        (sum, n) = (sum + p, n + 1);
-                    }
-                    last = best;
-                }
-                out[i] = (text, if n > 0 { sum / n as f32 } else { 0.0 });
-            }
+}
+
+/// CTC recognition of each box, batched by aspect ratio like Paddle (height 48, width ≥ 320).
+fn read(r: &mut Reader, bgra: &[u8], w: usize, boxes: &[[f32; 4]]) -> Result<Vec<(String, f32)>, String> {
+    let mut out = vec![(String::new(), 0.0); boxes.len()];
+    let ratio = |b: &[f32; 4]| b[2] / b[3].max(1.0);
+    let mut order: Vec<usize> = (0..boxes.len()).collect();
+    order.sort_by(|&a, &b| ratio(&boxes[a]).total_cmp(&ratio(&boxes[b])));
+    for batch in order.chunks(6) {
+        let max_ratio = batch.iter().map(|&i| ratio(&boxes[i])).fold(320.0 / 48.0, f32::max);
+        let img_w = (48.0 * max_ratio).ceil() as usize;
+        let mut data = vec![0f32; batch.len() * 3 * 48 * img_w];
+        for (k, &i) in batch.iter().enumerate() {
+            let b = boxes[i];
+            let crop = [b[0] as usize, b[1] as usize, (b[2] as usize).max(1), (b[3] as usize).max(1)];
+            let dw = ((48.0 * ratio(&b)).ceil() as usize).clamp(1, img_w);
+            to_chw(bgra, w, crop, dw, 48, &mut data[k * 3 * 48 * img_w..(k + 1) * 3 * 48 * img_w], img_w);
         }
-        Ok(out)
+        let outputs = r.session.run(ort::inputs![Tensor::from_array(([batch.len(), 3, 48, img_w], data)).map_err(err)?]).map_err(err)?;
+        let (shape, probs) = outputs[0].try_extract_tensor::<f32>().map_err(err)?;
+        let (steps, classes) = (shape[1] as usize, shape[2] as usize);
+        if classes == r.chars.len() + 1 && r.chars.last().is_some_and(|c| c != " ") {
+            r.chars.push(" ".into()); // Paddle appends a space class after the dictionary
+        }
+        for (k, &i) in batch.iter().enumerate() {
+            let (mut text, mut sum, mut n, mut last) = (String::new(), 0.0, 0, 0);
+            for t in 0..steps {
+                let row = &probs[(k * steps + t) * classes..(k * steps + t + 1) * classes];
+                let (best, p) = row.iter().enumerate().fold((0, f32::MIN), |m, (j, &p)| if p > m.1 { (j, p) } else { m });
+                if best != 0 && best != last {
+                    text.push_str(r.chars.get(best).map_or("", |s| s.as_str()));
+                    (sum, n) = (sum + p, n + 1);
+                }
+                last = best;
+            }
+            out[i] = (text, if n > 0 { sum / n as f32 } else { 0.0 });
+        }
     }
+    Ok(out)
 }
 
 /// Bilinear resize of a BGRA crop into a normalized CHW tensor ((v/255 - 0.5) / 0.5), BGR channel order like Paddle's
@@ -228,13 +304,13 @@ fn paddle_bench() {
     println!("gpu: {}", p.gpu);
     let dir = std::path::PathBuf::from(std::env::var("SCENES").unwrap());
     let mut out = serde_json::Map::new();
-    for name in ["dialogue", "cards", "hard_fonts", "hard_small", "hard_glow", "japanese"] {
+    for name in ["dialogue", "cards", "hard_fonts", "hard_small", "hard_glow", "japanese", "korean", "russian", "thai_src", "mixed"] {
         let px = std::fs::read(dir.join(format!("{name}.bgra"))).unwrap();
         p.recognize(&px, 1920, 1080).unwrap();
         let t = std::time::Instant::now();
         let lines = p.recognize(&px, 1920, 1080).unwrap();
         let ms = t.elapsed().as_secs_f64() * 1000.0;
-        println!("{name}: {} lines in {ms:.0} ms", lines.len());
+        println!("{name}: {} lines in {ms:.0} ms, small readers used: {:?}", lines.len(), p.last_scripts);
         let b = crate::ocr::blocks(lines.clone());
         let c = crate::ocr::find_choice(&b);
         println!("   choice {:?}", c.as_ref().map(|(o, strong)| (o.iter().map(|o| o.iter().map(|&i| b[i].text.as_str()).collect::<Vec<_>>().join(" | ")).collect::<Vec<_>>(), strong)));
@@ -244,4 +320,28 @@ fn paddle_bench() {
         out.insert(name.into(), serde_json::json!({ "ms": ms, "lines": lines.iter().map(|l| l.text.clone()).collect::<Vec<_>>() }));
     }
     std::fs::write(dir.join("paddle_rs.json"), serde_json::to_string_pretty(&out).unwrap()).unwrap();
+}
+
+/// `SCENES=<dir> cargo test --release paddle_scripts -- --ignored --nocapture`: every reader's text and confidence per line
+#[test]
+#[ignore]
+fn paddle_scripts() {
+    let models = std::path::PathBuf::from(std::env::var("LOCALAPPDATA").unwrap()).join("PaperTranslate").join("models");
+    let mut p = Paddle::load(&models).unwrap();
+    let dir = std::path::PathBuf::from(std::env::var("SCENES").unwrap());
+    for name in ["korean", "russian", "thai_src"] {
+        let px = std::fs::read(dir.join(format!("{name}.bgra"))).unwrap();
+        let boxes = p.detect(&px, 1920, 1080).unwrap();
+        let crops: Vec<[f32; 4]> = boxes.iter().map(|b| b.0).collect();
+        println!("== {name}: {} boxes", crops.len());
+        let main = read(&mut p.rec, &px, 1920, &crops).unwrap();
+        let alts: Vec<_> = p.scripts.iter_mut().map(|r| (r.name, read(r, &px, 1920, &crops).unwrap())).collect();
+        for i in 0..crops.len() {
+            println!("  box {:?}", crops[i].map(|v| v as i32));
+            println!("     main     {:.2} {:?}", main[i].1, main[i].0);
+            for (n, a) in &alts {
+                println!("     {n:8} {:.2} {:?}", a[i].1, a[i].0);
+            }
+        }
+    }
 }

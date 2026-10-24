@@ -30,6 +30,7 @@ const ORANGE: Color32 = Color32::from_rgb(0xE8, 0x6A, 0x10);
 const ORANGE_SOFT: Color32 = Color32::from_rgb(0xFC, 0xE3, 0xC8);
 const MARKER: Color32 = Color32::from_rgba_premultiplied(0x55, 0x37, 0x14, 0x55); // orange highlighter, ~33%
 const OVERLAY_TITLE: &str = "PaperTranslateOverlay";
+const SUGGEST_TITLE: &str = "PaperTranslateSuggest";
 
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
 #[serde(default)]
@@ -44,7 +45,8 @@ struct Config {
     mmproj_path: String,
     llama_server: String,
     highlight: bool,
-    choice_mode: bool,
+    /// suggest on every screen without being asked (off: only from the ★ Suggest button, auto can misfire outside games)
+    choice_auto: bool,
     interval_ms: u64,
 }
 
@@ -59,7 +61,7 @@ impl Default for Config {
             mmproj_path: String::new(),
             llama_server: String::new(),
             highlight: true,
-            choice_mode: true,
+            choice_auto: false,
             interval_ms: 1200,
         }
     }
@@ -122,6 +124,12 @@ struct Shared {
     vision: bool,
     /// which text reader the worker is using, for Settings
     reader: String,
+    /// one suggestion was asked for with the ★ Suggest button or the tray
+    ask_choice: bool,
+    /// short message on the status pill, e.g. "No choices found"
+    notice: Option<(String, Instant)>,
+    /// the choice window (physical px) while options are on screen and nothing is suggested yet: shows ★ Suggest
+    candidates: Option<[f32; 4]>,
     job: Job,
 }
 
@@ -131,7 +139,17 @@ impl Shared {
         self.active = !self.active;
         self.blocks.clear();
         self.choice = None;
+        self.candidates = None;
         self.status.clear();
+    }
+
+    /// Suggest a choice for the current screen; starts translating if it was off.
+    fn ask(&mut self) {
+        if !self.active {
+            self.toggle();
+        }
+        self.choice = None;
+        self.ask_choice = true;
     }
 }
 
@@ -235,9 +253,9 @@ fn worker(s: S, ctx: Context) {
     let mut cache_key = String::new();
     let mut last_frame: (Vec<u8>, Vec<ocr::Line>) = (vec![], vec![]);
     loop {
-        let (active, ready, vision, cfg) = {
+        let (active, ready, vision, ask, cfg) = {
             let g = s.lock().unwrap();
-            (g.active, g.ready, g.vision, g.cfg.clone())
+            (g.active, g.ready, g.vision, g.ask_choice, g.cfg.clone())
         };
         if !active {
             thread::sleep(Duration::from_millis(100));
@@ -245,7 +263,7 @@ fn worker(s: S, ctx: Context) {
         }
         let tick = Instant::now();
         let mut scan = || -> Result<(), String> {
-            let key = format!("{}|{}|{}", cfg.target_lang, cfg.highlight, cfg.choice_mode);
+            let key = format!("{}|{}", cfg.target_lang, cfg.highlight);
             if key != cache_key || cache.len() > 2000 {
                 (cache, picked, cache_key) = (HashMap::new(), None, key);
             }
@@ -264,13 +282,17 @@ fn worker(s: S, ctx: Context) {
                 (reader, last_frame) = (Some((want, r)), (vec![], vec![]));
             }
             // demo mode: hide the overlay from our own capture only, so screenshots and recordings still show it
-            let demo = std::env::var_os("PAPER_SHOW_IN_CAPTURE").map(|_| unsafe { FindWindowW(None, &windows::core::HSTRING::from(OVERLAY_TITLE)).unwrap_or_default() });
-            if let Some(h) = demo {
+            let demo: Vec<HWND> = std::env::var_os("PAPER_SHOW_IN_CAPTURE")
+                .map(|_| [OVERLAY_TITLE, SUGGEST_TITLE].iter().filter_map(|t| unsafe { FindWindowW(None, &windows::core::HSTRING::from(*t)) }.ok()).collect())
+                .unwrap_or_default();
+            for &h in &demo {
                 let _ = unsafe { SetWindowDisplayAffinity(h, WDA_EXCLUDEFROMCAPTURE) };
+            }
+            if !demo.is_empty() {
                 thread::sleep(Duration::from_millis(40)); // let DWM apply it before the capture
             }
             let captured = ocr::capture_foreground();
-            if let Some(h) = demo {
+            for &h in &demo {
                 let _ = unsafe { SetWindowDisplayAffinity(h, WDA_NONE) };
             }
             let (px, [x, y, w, h]) = captured?;
@@ -280,7 +302,12 @@ fn worker(s: S, ctx: Context) {
                 last_frame.1.clone()
             } else {
                 let mut lines = match &mut reader.as_mut().unwrap().1 {
-                    Reader::Paddle(p) => p.recognize(&px, w, h)?,
+                    Reader::Paddle(p) => {
+                        let lines = p.recognize(&px, w, h)?;
+                        let auto = if p.last_scripts.is_empty() { String::new() } else { format!(" · auto: {}", p.last_scripts.join(", ")) };
+                        s.lock().unwrap().reader = format!("PaddleOCR v6 · {}{auto}", if p.gpu { "GPU" } else { "CPU" });
+                        lines
+                    }
                     Reader::Windows(e) => ocr::recognize(e, &px, w, h)?,
                 };
                 for l in &mut lines {
@@ -291,10 +318,16 @@ fn worker(s: S, ctx: Context) {
                 lines
             };
             let blocks = ocr::blocks(lines);
-            let (choice, strong) = match ocr::find_choice(&blocks).filter(|_| cfg.choice_mode) {
+            let (choice, strong) = match ocr::find_choice(&blocks) {
                 Some((c, strong)) => (Some(c), strong),
                 None => (None, false),
             };
+            if ask && choice.is_none() {
+                let mut g = s.lock().unwrap();
+                g.ask_choice = false;
+                g.notice = Some(("No choices found on this screen".into(), Instant::now()));
+            }
+            let window = choice.as_ref().map(|c| union(c.iter().flatten().map(|&i| blocks[i].rect)));
             let in_choice = |r: &[usize]| choice.iter().flatten().flatten().any(|i| r.contains(i));
             let max_h = |r: &[usize]| r.iter().map(|&i| blocks[i].line_h).fold(0.0, f32::max);
             let mut regions = ocr::regions(&blocks, choice.as_deref());
@@ -318,16 +351,16 @@ fn worker(s: S, ctx: Context) {
                     for (src, t) in chunk.iter().zip(tr) {
                         cache.insert(src.clone(), t);
                     }
-                    if !publish(&s, &blocks, &cache, choice_view(&blocks, choice.as_deref(), &picked)) {
+                    if !publish(&s, &blocks, &cache, choice_view(&blocks, choice.as_deref(), &picked), window) {
                         return Ok(()); // turned off mid-scan
                     }
                     ctx.request_repaint();
                 }
                 // decide right after the choice window is translated, once per new set of options
                 // (sequential on purpose: two concurrent requests hang llama-server's Vulkan build with Gemma 4)
-                if let Some(c) = choice.as_ref().filter(|_| in_choice(region)) {
+                if let Some(c) = choice.as_ref().filter(|_| in_choice(region) && (ask || cfg.choice_auto)) {
                     let options = option_texts(&blocks, c);
-                    if picked.as_ref().is_none_or(|p| p.0 != options) {
+                    if ask || picked.as_ref().is_none_or(|p| p.0 != options) {
                         s.lock().unwrap().status = "Weighing the choices…".into();
                         ctx.request_repaint();
                         let window = union(c.iter().flatten().map(|&i| blocks[i].rect));
@@ -337,19 +370,22 @@ fn worker(s: S, ctx: Context) {
                         // the vision model decides from the screenshot; without one, the layout + text gate decides
                         // (a plain menu never gets that far: unmarked short labels with no question are filtered first)
                         let plausible = strong || ocr::worth_asking(&options, &scene);
-                        // hybrid: vision says whether it is a choice (14/15), text reasons about the best option (5/7)
-                        let seen = (plausible && vision).then(|| llm::is_choice_vision(&ocr::bmp_thumbnail(&px, w, h, 896), &options));
+                        // asked: the player says it is a choice, so just pick. Automatic: hybrid gate first — vision says
+                        // whether it is a choice (14/15), text reasons about the best option (5/7)
+                        let seen = (!ask && plausible && vision).then(|| llm::is_choice_vision(&ocr::bmp_thumbnail(&px, w, h, 896), &options));
                         let verdict = match seen {
+                            _ if ask => llm::pick_choice(&options, &scene, &cfg.target_lang, false)?,
                             Some(Ok(false)) => None,
                             Some(Ok(true)) => llm::pick_choice(&options, &scene, &cfg.target_lang, false)?,
                             _ if plausible => llm::pick_choice(&options, &scene, &cfg.target_lang, !strong)?,
                             _ => None,
                         };
                         picked = Some((options, verdict));
+                        s.lock().unwrap().ask_choice = false;
                     }
                 }
             }
-            publish(&s, &blocks, &cache, choice_view(&blocks, choice.as_deref(), &picked));
+            publish(&s, &blocks, &cache, choice_view(&blocks, choice.as_deref(), &picked), window);
             Ok(())
         };
         if let Err(e) = scan() {
@@ -361,7 +397,7 @@ fn worker(s: S, ctx: Context) {
 }
 
 /// Shows every line that has a translation; returns false when translation was turned off.
-fn publish(s: &S, lines: &[ocr::Line], cache: &HashMap<String, String>, choice: Option<ChoiceView>) -> bool {
+fn publish(s: &S, lines: &[ocr::Line], cache: &HashMap<String, String>, choice: Option<ChoiceView>, window: Option<[f32; 4]>) -> bool {
     let mut g = s.lock().unwrap();
     if !g.active {
         return false;
@@ -382,6 +418,7 @@ fn publish(s: &S, lines: &[ocr::Line], cache: &HashMap<String, String>, choice: 
     g.blocks = blocks;
     let born = g.choice.as_ref().filter(|old| choice.as_ref().is_some_and(|c| c.why == old.why)).map(|old| old.born);
     g.choice = choice.map(|c| ChoiceView { born: born.unwrap_or(c.born), ..c });
+    g.candidates = window.filter(|_| g.choice.is_none());
     true
 }
 
@@ -424,6 +461,8 @@ struct App {
     hotkeys: GlobalHotKeyManager,
     hotkey: Option<HotKey>,
     overlay: HWND,
+    /// the ★ Suggest window got its no-focus / no-capture styles
+    suggest_styled: bool,
     shown: bool,
     opened_at: Option<f64>,
     draft: Config,
@@ -457,16 +496,17 @@ impl App {
 
         let settings = MenuItem::new("Settings…", true, None);
         let toggle = MenuItem::new("Start / stop translating", true, None);
+        let suggest = MenuItem::new("Suggest a choice", true, None);
         let quit = MenuItem::new("Quit", true, None);
         let menu = Menu::new();
-        let _ = menu.append_items(&[&settings, &toggle, &PredefinedMenuItem::separator(), &quit]);
+        let _ = menu.append_items(&[&settings, &toggle, &suggest, &PredefinedMenuItem::separator(), &quit]);
         let tray = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_tooltip("Paper Translate")
             .with_icon(tray_icon_image())
             .build()
             .expect("tray icon");
-        let (sid, tid, qid) = (settings.id().clone(), toggle.id().clone(), quit.id().clone());
+        let (sid, tid, gid, qid) = (settings.id().clone(), toggle.id().clone(), suggest.id().clone(), quit.id().clone());
         let (s2, c2) = (s.clone(), ctx.clone());
         MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
             let mut g = s2.lock().unwrap();
@@ -474,6 +514,8 @@ impl App {
                 g.show_config = true;
             } else if e.id == tid {
                 g.toggle();
+            } else if e.id == gid {
+                g.ask();
             } else if e.id == qid {
                 if let Some(c) = g.server.as_mut() {
                     let _ = c.kill();
@@ -502,10 +544,11 @@ impl App {
         let mut app = Self {
             s: s.clone(),
             _tray: tray,
-            _menu: vec![settings, toggle, quit],
+            _menu: vec![settings, toggle, suggest, quit],
             hotkeys: GlobalHotKeyManager::new().expect("hotkey manager"),
             hotkey: None,
             overlay,
+            suggest_styled: false,
             shown: false,
             opened_at: None,
             draft: cfg.clone(),
@@ -518,7 +561,7 @@ impl App {
             custom_url: String::new(),
             model_dir: default_dir,
         };
-        if let Err(e) = app.apply_hotkey(&cfg.hotkey) {
+        if let Err(e) = rebind(&app.hotkeys, &mut app.hotkey, &cfg.hotkey) {
             app.msg = e;
         }
         if cfg.has_model() {
@@ -526,23 +569,6 @@ impl App {
         }
         thread::spawn(move || worker(s, ctx));
         app
-    }
-
-    fn apply_hotkey(&mut self, text: &str) -> Result<(), String> {
-        let hk: HotKey = text.parse().map_err(|e| format!("Invalid hotkey: {e}"))?;
-        if self.hotkey == Some(hk) {
-            return Ok(());
-        }
-        if let Some(old) = self.hotkey.take() {
-            let _ = self.hotkeys.unregister(old);
-        }
-        match self.hotkeys.register(hk) {
-            Ok(()) => {
-                self.hotkey = Some(hk);
-                Ok(())
-            }
-            Err(e) => Err(format!("Hotkey {text} is taken by another app ({e})")),
-        }
     }
 
     fn draw_overlay(&self, ui: &mut Ui, blocks: &[Block], choice: Option<&ChoiceView>, status: &str, highlight: bool) {
@@ -614,6 +640,47 @@ impl App {
         if animating {
             ui.ctx().request_repaint();
         }
+    }
+
+    /// A small clickable window above the choice window (the overlay itself lets clicks through to the game).
+    fn suggest_button(&mut self, ctx: &Context, window: [f32; 4]) {
+        let ppp = ctx.pixels_per_point();
+        let size = vec2(150.0, 40.0);
+        // right-aligned just above where the choice outline will be drawn (16 pt outside the options)
+        let at = pos2((window[0] + window[2]) / ppp + 16.0 - size.x, window[1] / ppp - 16.0 - size.y - 8.0).max(pos2(4.0, 4.0));
+        let builder = ViewportBuilder::default()
+            .with_title(SUGGEST_TITLE)
+            .with_decorations(false)
+            .with_transparent(true)
+            .with_always_on_top()
+            .with_taskbar(false)
+            .with_resizable(false)
+            .with_position(at)
+            .with_inner_size(size);
+        ctx.show_viewport_immediate(ViewportId::from_hash_of("suggest"), builder, |ui, _| {
+            if !self.suggest_styled {
+                // clicking must not take focus from the game, and OCR must not read the button
+                unsafe {
+                    if let Ok(h) = FindWindowW(None, &windows::core::HSTRING::from(SUGGEST_TITLE)) {
+                        let ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
+                        SetWindowLongPtrW(h, GWL_EXSTYLE, ex | (WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0) as isize);
+                        if std::env::var_os("PAPER_SHOW_IN_CAPTURE").is_none() {
+                            let _ = SetWindowDisplayAffinity(h, WDA_EXCLUDEFROMCAPTURE);
+                        }
+                        self.suggest_styled = true;
+                    }
+                }
+            }
+            let rect = ui.max_rect().shrink(2.0);
+            let r = ui.allocate_rect(rect, Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+            let (fill, ink) = if r.hovered() { (ORANGE, Color32::WHITE) } else { (PAPER, Color32::from_rgb(0xB3, 0x4A, 0x00)) };
+            let p = ui.painter();
+            p.rect(rect, 99, fill, Stroke::new(1.5, ORANGE), StrokeKind::Inside);
+            p.text(rect.center(), egui::Align2::CENTER_CENTER, "★ Suggest", FontId::proportional(17.0), ink);
+            if r.clicked() {
+                self.s.lock().unwrap().ask();
+            }
+        });
     }
 
     fn settings_ui(&mut self, ui: &mut Ui, opened: f64) {
@@ -772,30 +839,7 @@ impl App {
         }
         card(ui, a(1.0), |ui| {
             heading(ui, "Hotkey");
-            ui.horizontal(|ui| {
-                let label = if self.recording { "Press a key combo…".to_string() } else { self.draft.hotkey.clone() };
-                if ui.add(egui::Button::new(RichText::new(label).monospace().color(INK)).min_size(vec2(180.0, 30.0))).clicked() {
-                    self.recording = !self.recording;
-                }
-                ui.label(RichText::new("start / stop translating anywhere").color(MUTED));
-            });
-            if self.recording {
-                let combo = ui.input(|i| {
-                    i.events.iter().find_map(|e| match e {
-                        egui::Event::Key { key, pressed: true, modifiers, .. } => Some((*key, *modifiers)),
-                        _ => None,
-                    })
-                });
-                if let Some((key, m)) = combo {
-                    if key != egui::Key::Escape {
-                        let mods = [(m.ctrl, "Ctrl"), (m.shift, "Shift"), (m.alt, "Alt")];
-                        let mut parts: Vec<&str> = mods.iter().filter(|x| x.0).map(|x| x.1).collect();
-                        parts.push(key.name());
-                        self.draft.hotkey = parts.join("+");
-                    }
-                    self.recording = false;
-                }
-            }
+            hotkey_row(ui, &mut self.draft.hotkey, &mut self.recording, "start / stop translating anywhere");
         });
         card(ui, a(2.0), |ui| {
             heading(ui, "Languages");
@@ -857,7 +901,8 @@ impl App {
         card(ui, a(3.0), |ui| {
             heading(ui, "Overlay");
             ui.checkbox(&mut self.draft.highlight, "Highlight names, items and key terms in orange");
-            ui.checkbox(&mut self.draft.choice_mode, "Choice advisor: mark the best dialogue option");
+            ui.label(RichText::new("When choices are on screen, a ★ Suggest button appears above them.").size(12.0).color(MUTED));
+            ui.checkbox(&mut self.draft.choice_auto, "Suggest automatically (can also mark menus and lists outside games)");
             let mut secs = self.draft.interval_ms as f32 / 1000.0;
             ui.horizontal(|ui| {
                 ui.label("Scan every");
@@ -882,7 +927,7 @@ impl App {
         ui.horizontal(|ui| {
             if ui.add(primary("Save")).clicked() {
                 let hotkey = self.draft.hotkey.clone();
-                self.msg = match self.apply_hotkey(&hotkey) {
+                self.msg = match rebind(&self.hotkeys, &mut self.hotkey, &hotkey) {
                     Ok(()) => {
                         let mut g = self.s.lock().unwrap();
                         // model fields belong to the setup flow, keep its latest values
@@ -926,12 +971,20 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
-        let (active, show_cfg, blocks, choice, status, highlight) = {
+        let (active, show_cfg, blocks, choice, status, highlight, candidates) = {
             let g = self.s.lock().unwrap();
-            (g.active, g.show_config, g.blocks.clone(), g.choice.clone(), g.status.clone(), g.cfg.highlight)
+            let notice = g.notice.as_ref().filter(|n| n.1.elapsed() < Duration::from_secs(3)).map(|n| n.0.clone());
+            if notice.is_some() {
+                ui.ctx().request_repaint_after(Duration::from_millis(500)); // to hide it again
+            }
+            (g.active, g.show_config, g.blocks.clone(), g.choice.clone(), notice.unwrap_or_else(|| g.status.clone()), g.cfg.highlight, g.candidates)
         };
         if active {
             self.draw_overlay(ui, &blocks, choice.as_ref(), &status, highlight);
+        }
+        match candidates.filter(|_| active && choice.is_none()) {
+            Some(window) => self.suggest_button(ui.ctx(), window),
+            None => self.suggest_styled = false,
         }
         if !show_cfg {
             self.opened_at = None;
@@ -963,6 +1016,48 @@ impl eframe::App for App {
 
     fn clear_color(&self, _: &egui::Visuals) -> [f32; 4] {
         [0.0; 4]
+    }
+}
+
+/// Registers `text` in place of the hotkey in `slot`; the old one stays if the new one is invalid or taken.
+fn rebind(m: &GlobalHotKeyManager, slot: &mut Option<HotKey>, text: &str) -> Result<(), String> {
+    let hk: HotKey = text.parse().map_err(|e| format!("Invalid hotkey {text}: {e}"))?;
+    if *slot == Some(hk) {
+        return Ok(());
+    }
+    m.register(hk).map_err(|e| format!("Hotkey {text} is taken by another app ({e})"))?;
+    if let Some(old) = slot.replace(hk) {
+        let _ = m.unregister(old);
+    }
+    Ok(())
+}
+
+/// A hotkey button: click, then press the new combo (Esc cancels).
+fn hotkey_row(ui: &mut Ui, text: &mut String, recording: &mut bool, hint: &str) {
+    ui.horizontal(|ui| {
+        let label = if *recording { "Press a key combo…".to_string() } else { text.clone() };
+        if ui.add(egui::Button::new(RichText::new(label).monospace().color(INK)).min_size(vec2(180.0, 30.0))).clicked() {
+            *recording = !*recording;
+        }
+        ui.label(RichText::new(hint).color(MUTED));
+    });
+    if !*recording {
+        return;
+    }
+    let combo = ui.input(|i| {
+        i.events.iter().find_map(|e| match e {
+            egui::Event::Key { key, pressed: true, modifiers, .. } => Some((*key, *modifiers)),
+            _ => None,
+        })
+    });
+    if let Some((key, m)) = combo {
+        if key != egui::Key::Escape {
+            let mods = [(m.ctrl, "Ctrl"), (m.shift, "Shift"), (m.alt, "Alt")];
+            let mut parts: Vec<&str> = mods.iter().filter(|x| x.0).map(|x| x.1).collect();
+            parts.push(key.name());
+            *text = parts.join("+");
+        }
+        *recording = false;
     }
 }
 

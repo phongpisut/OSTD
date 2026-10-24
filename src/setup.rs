@@ -224,7 +224,7 @@ pub fn paddle_dir(model_path: &str) -> PathBuf {
 }
 
 pub fn paddle_ready(dir: &Path) -> bool {
-    crate::paddle::FILES.iter().all(|f| dir.join(f.2).is_file())
+    crate::paddle::FILES[..3].iter().all(|f| dir.join(f.2).is_file())
 }
 
 pub fn get_paddle(dir: &Path, mut progress: impl FnMut(u64, u64)) -> Result<(), String> {
