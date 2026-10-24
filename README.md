@@ -2,9 +2,9 @@
 
 Live on-screen translation overlay for Windows 11 games and apps. Press a hotkey and the text in the foreground
 window is covered by paper-style cards in your language. Names, items and key terms are highlighted in orange.
-When the game asks you to pick (A/B/C answers, ①②③, a roguelike reward screen), a **★ Suggest** button appears above
-the options. Click it and the whole choice window gets an orange outline, the best option a ★, and a short reason
-appears next to it.
+Press **Ctrl+Shift+T** and drag a box around the text you want translated, or just click to translate the whole game
+window. When the game asks you to pick (A/B/C answers, ①②③, a roguelike reward screen), click **★ Suggest** under the
+status pill. The choice window gets an orange outline, the best option a ★, and a short reason appears next to it.
 
 Reads English, Japanese, Chinese, Korean, Russian (Cyrillic) and Thai games, switching readers automatically, and
 translates into any language (Thai, Japanese, English…). Everything
@@ -20,14 +20,18 @@ On first launch, Paper Translate shows your GPU, VRAM and RAM, and recommends a 
 It downloads the model, the vision module and PaddleOCR from Hugging Face into a folder you choose. If `llama-server` is
 not on `PATH`, it also installs the newest llama.cpp Vulkan build, which runs on NVIDIA, AMD and Intel.
 
-After setup the app lives in the tray. Left-click the tray icon for Settings. Press **Ctrl+Shift+T** (configurable)
-to start or stop translating. The ★ Suggest button never takes focus from the game, and the tray menu has a "Suggest a
-choice" item too. Automatic suggestions can be turned on in Settings. They are off by default, because outside games
+After setup the app lives in the tray. Left-click the tray icon for Settings. The hotkey **Ctrl+Shift+T**
+(configurable) works like this:
+- Press it to start, then drag a box (a click means the whole window, right-click cancels).
+- Press it again to stop.
+
+Only the box is read and translated, and a thin orange frame marks it. The box selection and the ★ Suggest button never
+take focus from the game, and the tray menu has a "Suggest a choice" item too. Automatic suggestions can be turned on in Settings. They are off by default, because outside games
 they can also mark menus and lists.
 
 ## How it works
 
-1. **Capture** the foreground window. A screen that hasn't changed is not read again.
+1. **Capture** the dragged box, or the whole foreground window. A screen that hasn't changed is not read again.
 2. **Read text** with PaddleOCR PP-OCRv6 medium on the GPU (ONNX Runtime + DirectML), or Windows OCR on PCs with
    less VRAM. PP-OCRv6 reads Chinese, Japanese and Latin scripts. Some lines it can't read: it returns few letters
    for its box, or a low confidence. Those lines are re-read on the CPU by small PP-OCRv5 Korean, Cyrillic and Thai

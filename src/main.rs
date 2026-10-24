@@ -31,6 +31,7 @@ const ORANGE_SOFT: Color32 = Color32::from_rgb(0xFC, 0xE3, 0xC8);
 const MARKER: Color32 = Color32::from_rgba_premultiplied(0x55, 0x37, 0x14, 0x55); // orange highlighter, ~33%
 const OVERLAY_TITLE: &str = "PaperTranslateOverlay";
 const SUGGEST_TITLE: &str = "PaperTranslateSuggest";
+const SELECT_TITLE: &str = "PaperTranslateSelect";
 
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
 #[serde(default)]
@@ -128,8 +129,10 @@ struct Shared {
     ask_choice: bool,
     /// short message on the status pill, e.g. "No choices found"
     notice: Option<(String, Instant)>,
-    /// the choice window (physical px) while options are on screen and nothing is suggested yet: shows ★ Suggest
-    candidates: Option<[f32; 4]>,
+    /// the player is dragging a box to choose what to translate
+    selecting: bool,
+    /// the dragged box [x, y, w, h] in physical px; None = the whole game window
+    boundary: Option<[i32; 4]>,
     job: Job,
 }
 
@@ -139,13 +142,24 @@ impl Shared {
         self.active = !self.active;
         self.blocks.clear();
         self.choice = None;
-        self.candidates = None;
         self.status.clear();
     }
 
-    /// Suggest a choice for the current screen; starts translating if it was off.
+    /// The translation hotkey: off → drag a box to translate; while dragging → cancel; translating → stop.
+    fn hotkey(&mut self) {
+        if self.selecting {
+            self.selecting = false;
+        } else if self.active {
+            self.toggle();
+        } else {
+            self.selecting = true;
+        }
+    }
+
+    /// Suggest a choice for the current screen; starts translating the whole window if it was off.
     fn ask(&mut self) {
         if !self.active {
+            self.boundary = None;
             self.toggle();
         }
         self.choice = None;
@@ -253,9 +267,9 @@ fn worker(s: S, ctx: Context) {
     let mut cache_key = String::new();
     let mut last_frame: (Vec<u8>, Vec<ocr::Line>) = (vec![], vec![]);
     loop {
-        let (active, ready, vision, ask, cfg) = {
+        let (active, ready, vision, ask, boundary, cfg) = {
             let g = s.lock().unwrap();
-            (g.active, g.ready, g.vision, g.ask_choice, g.cfg.clone())
+            (g.active, g.ready, g.vision, g.ask_choice, g.boundary, g.cfg.clone())
         };
         if !active {
             thread::sleep(Duration::from_millis(100));
@@ -291,7 +305,7 @@ fn worker(s: S, ctx: Context) {
             if !demo.is_empty() {
                 thread::sleep(Duration::from_millis(40)); // let DWM apply it before the capture
             }
-            let captured = ocr::capture_foreground();
+            let captured = ocr::capture_foreground(boundary);
             for &h in &demo {
                 let _ = unsafe { SetWindowDisplayAffinity(h, WDA_NONE) };
             }
@@ -327,7 +341,6 @@ fn worker(s: S, ctx: Context) {
                 g.ask_choice = false;
                 g.notice = Some(("No choices found on this screen".into(), Instant::now()));
             }
-            let window = choice.as_ref().map(|c| union(c.iter().flatten().map(|&i| blocks[i].rect)));
             let in_choice = |r: &[usize]| choice.iter().flatten().flatten().any(|i| r.contains(i));
             let max_h = |r: &[usize]| r.iter().map(|&i| blocks[i].line_h).fold(0.0, f32::max);
             let mut regions = ocr::regions(&blocks, choice.as_deref());
@@ -351,7 +364,7 @@ fn worker(s: S, ctx: Context) {
                     for (src, t) in chunk.iter().zip(tr) {
                         cache.insert(src.clone(), t);
                     }
-                    if !publish(&s, &blocks, &cache, choice_view(&blocks, choice.as_deref(), &picked), window) {
+                    if !publish(&s, &blocks, &cache, choice_view(&blocks, choice.as_deref(), &picked)) {
                         return Ok(()); // turned off mid-scan
                     }
                     ctx.request_repaint();
@@ -385,7 +398,7 @@ fn worker(s: S, ctx: Context) {
                     }
                 }
             }
-            publish(&s, &blocks, &cache, choice_view(&blocks, choice.as_deref(), &picked), window);
+            publish(&s, &blocks, &cache, choice_view(&blocks, choice.as_deref(), &picked));
             Ok(())
         };
         if let Err(e) = scan() {
@@ -397,7 +410,7 @@ fn worker(s: S, ctx: Context) {
 }
 
 /// Shows every line that has a translation; returns false when translation was turned off.
-fn publish(s: &S, lines: &[ocr::Line], cache: &HashMap<String, String>, choice: Option<ChoiceView>, window: Option<[f32; 4]>) -> bool {
+fn publish(s: &S, lines: &[ocr::Line], cache: &HashMap<String, String>, choice: Option<ChoiceView>) -> bool {
     let mut g = s.lock().unwrap();
     if !g.active {
         return false;
@@ -418,7 +431,6 @@ fn publish(s: &S, lines: &[ocr::Line], cache: &HashMap<String, String>, choice: 
     g.blocks = blocks;
     let born = g.choice.as_ref().filter(|old| choice.as_ref().is_some_and(|c| c.why == old.why)).map(|old| old.born);
     g.choice = choice.map(|c| ChoiceView { born: born.unwrap_or(c.born), ..c });
-    g.candidates = window.filter(|_| g.choice.is_none());
     true
 }
 
@@ -463,6 +475,9 @@ struct App {
     overlay: HWND,
     /// the ★ Suggest window got its no-focus / no-capture styles
     suggest_styled: bool,
+    /// the box-selection window got its no-focus style
+    select_styled: bool,
+    drag_from: Option<egui::Pos2>,
     shown: bool,
     opened_at: Option<f64>,
     draft: Config,
@@ -513,7 +528,7 @@ impl App {
             if e.id == sid {
                 g.show_config = true;
             } else if e.id == tid {
-                g.toggle();
+                g.hotkey();
             } else if e.id == gid {
                 g.ask();
             } else if e.id == qid {
@@ -534,7 +549,7 @@ impl App {
         let (s2, c2) = (s.clone(), ctx.clone());
         GlobalHotKeyEvent::set_event_handler(Some(move |e: GlobalHotKeyEvent| {
             if e.state == HotKeyState::Pressed {
-                s2.lock().unwrap().toggle();
+                s2.lock().unwrap().hotkey();
                 c2.request_repaint();
             }
         }));
@@ -549,6 +564,8 @@ impl App {
             hotkey: None,
             overlay,
             suggest_styled: false,
+            select_styled: false,
+            drag_from: None,
             shown: false,
             opened_at: None,
             draft: cfg.clone(),
@@ -571,8 +588,13 @@ impl App {
         app
     }
 
-    fn draw_overlay(&self, ui: &mut Ui, blocks: &[Block], choice: Option<&ChoiceView>, status: &str, highlight: bool) {
+    fn draw_overlay(&self, ui: &mut Ui, blocks: &[Block], choice: Option<&ChoiceView>, status: &str, highlight: bool, boundary: Option<[i32; 4]>) {
         let ppp = ui.ctx().pixels_per_point();
+        if let Some([x, y, w, h]) = boundary {
+            // a quiet frame so the player knows what is being translated
+            let r = Rect::from_min_size(pos2(x as f32, y as f32) / ppp, vec2(w as f32, h as f32) / ppp);
+            ui.painter().rect_stroke(r, 4, Stroke::new(1.5, ORANGE.gamma_multiply(0.7)), StrokeKind::Outside);
+        }
         let mut animating = false;
         let mut cards = vec![];
         for b in blocks {
@@ -642,12 +664,11 @@ impl App {
         }
     }
 
-    /// A small clickable window above the choice window (the overlay itself lets clicks through to the game).
-    fn suggest_button(&mut self, ctx: &Context, window: [f32; 4]) {
-        let ppp = ctx.pixels_per_point();
-        let size = vec2(150.0, 40.0);
-        // right-aligned just above where the choice outline will be drawn (16 pt outside the options)
-        let at = pos2((window[0] + window[2]) / ppp + 16.0 - size.x, window[1] / ppp - 16.0 - size.y - 8.0).max(pos2(4.0, 4.0));
+    /// A small clickable window right under the status pill (the overlay itself lets clicks through to the game).
+    fn suggest_button(&mut self, ctx: &Context) {
+        let size = vec2(140.0, 34.0);
+        let screen_w = unsafe { GetSystemMetrics(SM_CXSCREEN) } as f32 / ctx.pixels_per_point();
+        let at = pos2(screen_w / 2.0 - size.x / 2.0, 48.0);
         let builder = ViewportBuilder::default()
             .with_title(SUGGEST_TITLE)
             .with_decorations(false)
@@ -655,6 +676,7 @@ impl App {
             .with_always_on_top()
             .with_taskbar(false)
             .with_resizable(false)
+            .with_active(false)
             .with_position(at)
             .with_inner_size(size);
         ctx.show_viewport_immediate(ViewportId::from_hash_of("suggest"), builder, |ui, _| {
@@ -662,8 +684,7 @@ impl App {
                 // clicking must not take focus from the game, and OCR must not read the button
                 unsafe {
                     if let Ok(h) = FindWindowW(None, &windows::core::HSTRING::from(SUGGEST_TITLE)) {
-                        let ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
-                        SetWindowLongPtrW(h, GWL_EXSTYLE, ex | (WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0) as isize);
+                        no_focus(h);
                         if std::env::var_os("PAPER_SHOW_IN_CAPTURE").is_none() {
                             let _ = SetWindowDisplayAffinity(h, WDA_EXCLUDEFROMCAPTURE);
                         }
@@ -676,11 +697,99 @@ impl App {
             let (fill, ink) = if r.hovered() { (ORANGE, Color32::WHITE) } else { (PAPER, Color32::from_rgb(0xB3, 0x4A, 0x00)) };
             let p = ui.painter();
             p.rect(rect, 99, fill, Stroke::new(1.5, ORANGE), StrokeKind::Inside);
-            p.text(rect.center(), egui::Align2::CENTER_CENTER, "★ Suggest", FontId::proportional(17.0), ink);
+            p.text(rect.center(), egui::Align2::CENTER_CENTER, "★ Suggest", FontId::proportional(15.0), ink);
             if r.clicked() {
                 self.s.lock().unwrap().ask();
             }
         });
+    }
+
+    /// A full-screen window that takes the mouse for the box selection. Its own window, because switching the
+    /// click-through overlay to take the mouse left it opaque.
+    fn select_window(&mut self, ctx: &Context) {
+        let ppp = ctx.pixels_per_point();
+        let size = unsafe { vec2(GetSystemMetrics(SM_CXSCREEN) as f32, GetSystemMetrics(SM_CYSCREEN) as f32) } / ppp;
+        let builder = ViewportBuilder::default()
+            .with_title(SELECT_TITLE)
+            .with_decorations(false)
+            .with_transparent(true)
+            .with_always_on_top()
+            .with_taskbar(false)
+            .with_resizable(false)
+            .with_active(false)
+            .with_position(pos2(0.0, 0.0))
+            .with_inner_size(size);
+        ctx.show_viewport_immediate(ViewportId::from_hash_of("select"), builder, |ui, _| {
+            if !self.select_styled {
+                if let Ok(h) = unsafe { FindWindowW(None, &windows::core::HSTRING::from(SELECT_TITLE)) } {
+                    no_focus(h);
+                    self.select_styled = true;
+                }
+            }
+            self.select_ui(ui);
+        });
+    }
+
+    /// Drag a box around the text to translate; a click without dragging means the whole game window, right-click cancels.
+    fn select_ui(&mut self, ui: &mut Ui) {
+        let ctx = ui.ctx().clone();
+        ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+        let screen = ui.max_rect();
+        let resp = ui.allocate_rect(screen, Sense::click_and_drag());
+        if resp.drag_started() {
+            // where the button went down, not where the drag threshold was crossed
+            self.drag_from = ctx.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos());
+        }
+        let sel = self.drag_from.zip(ctx.pointer_latest_pos()).map(|(a, b)| Rect::from_two_pos(a, b));
+        let p = ui.painter();
+        let dim = Color32::from_black_alpha(110);
+        match sel {
+            Some(r) => {
+                // dim everything but the box
+                for side in [
+                    Rect::from_min_max(screen.min, pos2(screen.max.x, r.min.y)),
+                    Rect::from_min_max(pos2(screen.min.x, r.max.y), screen.max),
+                    Rect::from_min_max(pos2(screen.min.x, r.min.y), pos2(r.min.x, r.max.y)),
+                    Rect::from_min_max(pos2(r.max.x, r.min.y), pos2(screen.max.x, r.max.y)),
+                ] {
+                    p.rect_filled(side, 0, dim);
+                }
+                p.rect_stroke(r, 2, Stroke::new(2.0, ORANGE), StrokeKind::Outside);
+                ctx.request_repaint();
+            }
+            None => {
+                p.rect_filled(screen, 0, dim);
+            }
+        }
+        let g = p.layout_no_wrap(
+            "Drag a box around the text to translate  ·  click: whole window  ·  right-click: cancel".into(),
+            FontId::proportional(14.0),
+            INK,
+        );
+        let pill = Rect::from_center_size(pos2(screen.center().x, 30.0), g.size() + vec2(28.0, 14.0));
+        p.rect(pill, 99, PAPER, Stroke::new(1.0, ORANGE), StrokeKind::Inside);
+        p.galley(pill.min + vec2(14.0, 7.0), g, INK);
+
+        let ppp = ctx.pixels_per_point();
+        let finish = |boundary: Option<[i32; 4]>| {
+            let mut g = self.s.lock().unwrap();
+            g.selecting = false;
+            g.boundary = boundary;
+            if !g.active {
+                g.toggle();
+            }
+        };
+        if resp.secondary_clicked() {
+            self.s.lock().unwrap().selecting = false;
+        } else if resp.drag_stopped() {
+            let box_px = sel.filter(|r| r.width() >= 12.0 && r.height() >= 12.0).map(|r| {
+                let r = Rect::from_min_max(r.min * ppp, r.max * ppp);
+                [r.min.x as i32, r.min.y as i32, r.width() as i32, r.height() as i32]
+            });
+            finish(box_px);
+        } else if resp.clicked() {
+            finish(None);
+        }
     }
 
     fn settings_ui(&mut self, ui: &mut Ui, opened: f64) {
@@ -839,7 +948,7 @@ impl App {
         }
         card(ui, a(1.0), |ui| {
             heading(ui, "Hotkey");
-            hotkey_row(ui, &mut self.draft.hotkey, &mut self.recording, "start / stop translating anywhere");
+            hotkey_row(ui, &mut self.draft.hotkey, &mut self.recording, "drag a box to translate · press again to stop");
         });
         card(ui, a(2.0), |ui| {
             heading(ui, "Languages");
@@ -901,7 +1010,7 @@ impl App {
         card(ui, a(3.0), |ui| {
             heading(ui, "Overlay");
             ui.checkbox(&mut self.draft.highlight, "Highlight names, items and key terms in orange");
-            ui.label(RichText::new("When choices are on screen, a ★ Suggest button appears above them.").size(12.0).color(MUTED));
+            ui.label(RichText::new("While translating, the ★ Suggest button under the status pill picks the best choice on screen.").size(12.0).color(MUTED));
             ui.checkbox(&mut self.draft.choice_auto, "Suggest automatically (can also mark menus and lists outside games)");
             let mut secs = self.draft.interval_ms as f32 / 1000.0;
             ui.horizontal(|ui| {
@@ -947,15 +1056,17 @@ impl App {
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
-        let (active, show_cfg) = {
+        let (active, selecting, show_cfg) = {
             let g = self.s.lock().unwrap();
-            (g.active, g.show_config)
+            (g.active, g.selecting, g.show_config)
         };
         if active != self.shown {
             self.shown = active;
             // Win32 directly: winit's show would activate the window and steal focus from the game
             unsafe {
                 if active {
+                    // winit rewrites the extended style, so no-activate is put back each time
+                    no_focus(self.overlay);
                     let (w, h) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
                     let _ = SetWindowPos(self.overlay, Some(HWND_TOPMOST), 0, 0, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
                 } else {
@@ -964,6 +1075,10 @@ impl eframe::App for App {
             }
             ctx.request_repaint();
         }
+        if selecting {
+            // the selection window lives inside the root pass, which is skipped while the overlay is hidden
+            ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaintWhileHidden);
+        }
         if show_cfg {
             // the settings window lives inside the root pass, which is skipped while the overlay is hidden
             ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaintWhileHidden);
@@ -971,20 +1086,26 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
-        let (active, show_cfg, blocks, choice, status, highlight, candidates) = {
+        let (active, selecting, boundary, show_cfg, blocks, choice, status, highlight) = {
             let g = self.s.lock().unwrap();
             let notice = g.notice.as_ref().filter(|n| n.1.elapsed() < Duration::from_secs(3)).map(|n| n.0.clone());
             if notice.is_some() {
                 ui.ctx().request_repaint_after(Duration::from_millis(500)); // to hide it again
             }
-            (g.active, g.show_config, g.blocks.clone(), g.choice.clone(), notice.unwrap_or_else(|| g.status.clone()), g.cfg.highlight, g.candidates)
+            let status = notice.unwrap_or_else(|| g.status.clone());
+            (g.active, g.selecting, g.boundary, g.show_config, g.blocks.clone(), g.choice.clone(), status, g.cfg.highlight)
         };
-        if active {
-            self.draw_overlay(ui, &blocks, choice.as_ref(), &status, highlight);
+        if selecting {
+            self.select_window(ui.ctx());
+            self.suggest_styled = false;
+        } else if active {
+            self.draw_overlay(ui, &blocks, choice.as_ref(), &status, highlight, boundary);
+            self.suggest_button(ui.ctx());
+        } else {
+            self.suggest_styled = false;
         }
-        match candidates.filter(|_| active && choice.is_none()) {
-            Some(window) => self.suggest_button(ui.ctx(), window),
-            None => self.suggest_styled = false,
+        if !selecting {
+            (self.select_styled, self.drag_from) = (false, None);
         }
         if !show_cfg {
             self.opened_at = None;
@@ -1016,6 +1137,14 @@ impl eframe::App for App {
 
     fn clear_color(&self, _: &egui::Visuals) -> [f32; 4] {
         [0.0; 4]
+    }
+}
+
+/// Clicks on this window must not take focus from the game.
+fn no_focus(h: HWND) {
+    unsafe {
+        let ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
+        SetWindowLongPtrW(h, GWL_EXSTYLE, ex | (WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0) as isize);
     }
 }
 

@@ -26,16 +26,19 @@ pub fn engine(lang: &str) -> Result<OcrEngine, String> {
     OcrEngine::TryCreateFromLanguage(&l).map_err(|_| format!("OCR language '{lang}' is not installed in Windows"))
 }
 
-/// Captures the foreground window (the game) clipped to the primary monitor; returns BGRA pixels and the
-/// captured rect [x, y, w, h]. Falls back to the whole monitor for tiny or missing foreground windows.
+/// Captures the box the player dragged, or else the foreground window (the game), clipped to the primary monitor;
+/// returns BGRA pixels and the captured rect [x, y, w, h]. Falls back to the whole monitor for tiny or missing windows.
 /// shortcut: primary monitor only via GDI, upgrade to Windows.Graphics.Capture for multi-monitor or exclusive-fullscreen games.
-pub fn capture_foreground() -> Result<(Vec<u8>, [i32; 4]), String> {
+pub fn capture_foreground(boundary: Option<[i32; 4]>) -> Result<(Vec<u8>, [i32; 4]), String> {
     unsafe {
         let (sw, sh) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
         let mut r = RECT::default();
         let fg = GetForegroundWindow();
-        let [x, y, w, h] = match !fg.is_invalid() && GetWindowRect(fg, &mut r).is_ok() {
-            true if r.right.min(sw) - r.left.max(0) >= 200 && r.bottom.min(sh) - r.top.max(0) >= 100 => {
+        if let Some([bx, by, bw, bh]) = boundary {
+            r = RECT { left: bx, top: by, right: bx + bw, bottom: by + bh };
+        }
+        let [x, y, w, h] = match boundary.is_some() || (!fg.is_invalid() && GetWindowRect(fg, &mut r).is_ok()) {
+            true if r.right.min(sw) - r.left.max(0) >= 16 && r.bottom.min(sh) - r.top.max(0) >= 16 => {
                 [r.left.max(0), r.top.max(0), r.right.min(sw) - r.left.max(0), r.bottom.min(sh) - r.top.max(0)]
             }
             _ => [0, 0, sw, sh],
