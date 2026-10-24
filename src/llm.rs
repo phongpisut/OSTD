@@ -54,7 +54,16 @@ pub fn translate(lines: &[String], target: &str, highlight: bool) -> Result<Vec<
     if translated.len() != n {
         return Err(format!("model returned {} lines for {n}", translated.len()));
     }
-    Ok(translated)
+    // a small model sometimes returns just punctuation for one line of a batch; retry that line alone, else keep the source
+    Ok(translated
+        .into_iter()
+        .enumerate()
+        .map(|(i, t)| match t.chars().any(char::is_alphanumeric) {
+            true => t,
+            false if n > 1 => translate(&lines[i..=i], target, highlight).map_or_else(|_| lines[i].clone(), |mut v| v.remove(0)),
+            false => lines[i].clone(),
+        })
+        .collect())
 }
 
 /// Decision model. The layout already found candidate options; `confirm` is set when that evidence is weak (an
@@ -100,26 +109,21 @@ fn base64(data: &[u8]) -> String {
     out
 }
 
-/// Vision decision: the model looks at the screenshot (BMP) and the candidate options from OCR, decides whether
-/// the game is asking for a pick right now and which option is best. Gemma 4 E2B got 5/5 test screens right;
-/// sub-1B vision models said "choice" for everything.
-pub fn pick_choice_vision(screen_bmp: &[u8], options: &[String], target: &str) -> Result<Option<(usize, String)>, String> {
-    // a label pick ("player_choice" / "story" / ...) scored 5/5 at every image size; a yes/no flipped on menus
+/// Vision gate: the model looks at the screenshot (BMP) and the candidate options from OCR and says whether the game is
+/// asking for a pick right now. Benchmark on 15 screens: vision 14/15 here vs 10/15 text-only and 8–10/15 for Laya
+/// zero-shot; but vision picks the best option poorly (2/7, biased to option 1), so `pick_choice` does that part.
+pub fn is_choice_vision(screen_bmp: &[u8], options: &[String]) -> Result<bool, String> {
+    // a label pick ("player_choice" / "story" / ...) held at every image size; a yes/no flipped on menus
     let text = format!(
         "The text detector found these lines on screen:\n{}\nLook at the screenshot and set kind to what these lines are: \
          \"player_choice\" if the game is waiting for the player to pick one of them now (dialogue answers, rewards, upgrades, \
-         cards), \"story\" for narration or spoken lines, \"menu\" for title or settings menus, \"hud\" for status labels. Then set \
-         best to the number of the wisest line and give a one-sentence reason in {target} in why.",
+         cards), \"story\" for narration or spoken lines, \"menu\" for title or settings menus, \"hud\" for status labels.",
         numbered(options)
     );
     let schema = json!({
         "type": "object",
-        "properties": {
-            "kind": { "enum": ["player_choice", "story", "menu", "hud"] },
-            "best": { "enum": (0..options.len()).collect::<Vec<_>>() },
-            "why": { "type": "string", "maxLength": 200 }
-        },
-        "required": ["kind", "best", "why"], "additionalProperties": false
+        "properties": { "kind": { "enum": ["player_choice", "story", "menu", "hud"] } },
+        "required": ["kind"], "additionalProperties": false
     });
     let body = json!({
         "messages": [{ "role": "user", "content": [
@@ -127,7 +131,7 @@ pub fn pick_choice_vision(screen_bmp: &[u8], options: &[String], target: &str) -
             { "type": "text", "text": text },
         ] }],
         "temperature": 0.0,
-        "max_tokens": 250,
+        "max_tokens": 20,
         "response_format": { "type": "json_schema", "json_schema": { "name": "decision", "schema": schema } },
     });
     let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(60))).build().into();
@@ -136,11 +140,7 @@ pub fn pick_choice_vision(screen_bmp: &[u8], options: &[String], target: &str) -
         .map_err(|e| format!("llama-server: {e}"))?;
     let content = resp["choices"][0]["message"]["content"].as_str().unwrap_or("");
     let out: Value = serde_json::from_str(content).map_err(|e| format!("bad JSON from vision model: {e}"))?;
-    if out["kind"] != "player_choice" {
-        return Ok(None);
-    }
-    let best = out["best"].as_u64().map(|b| b as usize).filter(|&b| b < options.len()).ok_or("model gave no choice")?;
-    Ok(Some((best, out["why"].as_str().unwrap_or("").to_string())))
+    Ok(out["kind"] == "player_choice")
 }
 
 #[test]
@@ -177,9 +177,9 @@ fn vision_e2e() {
         if let Ok(out) = std::env::var("THUMB_OUT") {
             std::fs::write(std::path::Path::new(&out).join(format!("{name}_thumb.bmp")), &bmp).unwrap();
         }
-        let r = pick_choice_vision(&bmp, options, "Thai");
+        let r = is_choice_vision(&bmp, options);
         println!("{name}: {r:?} in {:?}", t.elapsed());
-        right += (r.as_ref().is_ok_and(|v| v.is_some() == *truth)) as usize;
+        right += r.as_ref().is_ok_and(|v| v == truth) as usize;
     }
     let _ = server.kill();
     assert_eq!(right, scenes.len());
@@ -206,7 +206,8 @@ fn e2e() {
     let t0 = std::time::Instant::now();
     let tr = translate(&[scene.clone(), options.clone()].concat(), "Thai", true);
     println!("{tr:#?} in {:?}", t0.elapsed());
-    let jp = s(&["長老ミラ", "昨夜、ストームホールドから月光石の首飾りが盗まれた。影のギルドが売れば、古い封印が壊れてしまう。", "① 今夜、泥棒を追いかける。", "② 私には関係ない。", "③ 先に金貨500枚を払え。"]);
+    // exactly what PaddleOCR reads off the Japanese scene (no space after the markers)
+    let jp = s(&["長老ミラ", "昨夜、ストームホールドから月光石の首飾りが盗まれた。影のギルドが売れば、古い封印が壊れてしまう。", "①今夜、泥棒を追いかける。", "②私には関係ない。", "③先に金貨500枚を払え。"]);
     println!("japanese → Thai: {:#?}", translate(&jp, "Thai", true));
     let t0 = std::time::Instant::now();
     let dialogue = pick_choice(&options, &scene, "Thai", false);

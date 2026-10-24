@@ -1,6 +1,10 @@
-<!-- Per-user MSI (no admin): the exe, a Start Menu shortcut and an uninstaller.
+<!-- Per-user MSI (no admin): the exe, DirectML.dll (GPU runtime for PaddleOCR), a Start Menu shortcut and an uninstaller.
      Models, llama.cpp and settings are downloaded or created by the app under %APPDATA% / %LOCALAPPDATA%.
-     Build: wix build installer/PaperTranslate.wxs -d Version=0.1.0 -o PaperTranslate-Setup.msi -->
+     Build: wix build installer/PaperTranslate.wxs -d Version=0.1.0 -arch x64 -o dist/PaperTranslate-0.1.0-Setup.msi
+     (-d BinDir=<folder> if the release build is not in target/release) -->
+<?ifndef BinDir ?>
+<?define BinDir = "target/release" ?>
+<?endif ?>
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
   <Package Name="Paper Translate" Manufacturer="phongpisut" Version="$(Version)" Scope="perUser"
            UpgradeCode="6f3c2d1e-8a47-4b9e-9d2a-5e1f0c7b3a94">
@@ -18,7 +22,8 @@
 
     <Feature Id="Main">
       <Component Directory="INSTALLFOLDER" Guid="2b8e4f61-3c9d-4a7e-b5f2-8d1c6e0a9f37">
-        <File Source="target/release/paper-translate.exe" />
+        <File Source="$(BinDir)/paper-translate.exe" />
+        <File Source="$(BinDir)/DirectML.dll" />
         <!-- per-user components need a registry key path -->
         <RegistryValue Root="HKCU" Key="Software\PaperTranslate" Name="installed" Type="integer" Value="1" KeyPath="yes" />
         <RemoveFolder Id="RemoveInstallFolder" On="uninstall" />

@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod llm;
 mod ocr;
+mod paddle;
 mod setup;
 
 use eframe::egui::{
@@ -34,6 +35,8 @@ const OVERLAY_TITLE: &str = "PaperTranslateOverlay";
 #[serde(default)]
 struct Config {
     hotkey: String,
+    /// "paddle" (PP-OCRv6 on the GPU, default) or "windows" (built-in OCR)
+    ocr_engine: String,
     ocr_lang: String,
     target_lang: String,
     model_path: String,
@@ -49,6 +52,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             hotkey: "Ctrl+Shift+T".into(),
+            ocr_engine: "paddle".into(),
             ocr_lang: "en-US".into(),
             target_lang: "Thai".into(),
             model_path: String::new(),
@@ -116,6 +120,8 @@ struct Shared {
     ready: bool,
     /// the running server can see screenshots (mmproj loaded)
     vision: bool,
+    /// which text reader the worker is using, for Settings
+    reader: String,
     job: Job,
 }
 
@@ -162,7 +168,19 @@ fn boot_server(s: S, ctx: Context) {
     });
 }
 
-fn run_setup(s: S, ctx: Context, url: String, dest: PathBuf, mmproj: Option<(String, PathBuf)>) {
+fn get_paddle(s: S, ctx: Context, dir: PathBuf) {
+    s.lock().unwrap().job = Job { busy: true, label: "Downloading PaddleOCR…".into(), ..Default::default() };
+    thread::spawn(move || {
+        let r = setup::get_paddle(&dir, |done, total| {
+            s.lock().unwrap().job = Job { busy: true, label: "Downloading PaddleOCR…".into(), done, total, error: String::new() };
+            ctx.request_repaint();
+        });
+        s.lock().unwrap().job = Job { error: r.err().unwrap_or_default(), ..Default::default() };
+        ctx.request_repaint();
+    });
+}
+
+fn run_setup(s: S, ctx: Context, url: String, dest: PathBuf, mmproj: Option<(String, PathBuf)>, paddle: bool) {
     s.lock().unwrap().job = Job { busy: true, label: "Starting…".into(), ..Default::default() };
     thread::spawn(move || {
         let progress = |label: &str, done, total| {
@@ -183,10 +201,14 @@ fn run_setup(s: S, ctx: Context, url: String, dest: PathBuf, mmproj: Option<(Str
             if let Some((url, path)) = mmproj.as_ref().filter(|m| !m.1.is_file()) {
                 setup::download(url, path, |d, t| progress("Downloading vision module…", d, t))?;
             }
+            if paddle {
+                setup::get_paddle(dest.parent().unwrap(), |d, t| progress("Downloading PaddleOCR…", d, t))?;
+            }
             let mut g = s.lock().unwrap();
             g.cfg.llama_server = exe.display().to_string();
             g.cfg.model_path = dest.display().to_string();
             g.cfg.mmproj_path = mmproj.map(|m| m.1.display().to_string()).unwrap_or_default();
+            g.cfg.ocr_engine = if paddle { "paddle" } else { "windows" }.into();
             g.cfg.save();
             Ok(())
         })();
@@ -199,13 +221,19 @@ fn run_setup(s: S, ctx: Context, url: String, dest: PathBuf, mmproj: Option<(Str
     });
 }
 
+enum Reader {
+    Paddle(paddle::Paddle),
+    Windows(windows::Media::Ocr::OcrEngine),
+}
+
 /// Capture → OCR → translate only the lines not seen before → publish blocks for the overlay.
 fn worker(s: S, ctx: Context) {
     let mut cache: HashMap<String, String> = HashMap::new();
     // option texts of the last choice window → the decision model's verdict (None = not a real choice)
     let mut picked: Option<(Vec<String>, Option<(usize, String)>)> = None;
-    let mut engine: Option<(String, windows::Media::Ocr::OcrEngine)> = None;
+    let mut reader: Option<(String, Reader)> = None;
     let mut cache_key = String::new();
+    let mut last_frame: (Vec<u8>, Vec<ocr::Line>) = (vec![], vec![]);
     loop {
         let (active, ready, vision, cfg) = {
             let g = s.lock().unwrap();
@@ -221,8 +249,19 @@ fn worker(s: S, ctx: Context) {
             if key != cache_key || cache.len() > 2000 {
                 (cache, picked, cache_key) = (HashMap::new(), None, key);
             }
-            if engine.as_ref().is_none_or(|e| e.0 != cfg.ocr_lang) {
-                engine = Some((cfg.ocr_lang.clone(), ocr::engine(&cfg.ocr_lang)?));
+            let dir = setup::paddle_dir(&cfg.model_path);
+            let use_paddle = cfg.ocr_engine == "paddle" && setup::paddle_ready(&dir);
+            let want = if use_paddle { format!("paddle|{}", dir.display()) } else { format!("windows|{}", cfg.ocr_lang) };
+            if reader.as_ref().is_none_or(|r| r.0 != want) {
+                let r = match use_paddle.then(|| paddle::Paddle::load(&dir)) {
+                    Some(Ok(p)) => Reader::Paddle(p),
+                    _ => Reader::Windows(ocr::engine(&cfg.ocr_lang)?),
+                };
+                s.lock().unwrap().reader = match &r {
+                    Reader::Paddle(p) => format!("PaddleOCR v6 · {}", if p.gpu { "GPU" } else { "CPU" }),
+                    Reader::Windows(_) => format!("Windows OCR · {}", cfg.ocr_lang),
+                };
+                (reader, last_frame) = (Some((want, r)), (vec![], vec![]));
             }
             // demo mode: hide the overlay from our own capture only, so screenshots and recordings still show it
             let demo = std::env::var_os("PAPER_SHOW_IN_CAPTURE").map(|_| unsafe { FindWindowW(None, &windows::core::HSTRING::from(OVERLAY_TITLE)).unwrap_or_default() });
@@ -235,11 +274,22 @@ fn worker(s: S, ctx: Context) {
                 let _ = unsafe { SetWindowDisplayAffinity(h, WDA_NONE) };
             }
             let (px, [x, y, w, h]) = captured?;
-            let mut lines = ocr::recognize(&engine.as_ref().unwrap().1, &px, w, h)?;
-            for l in &mut lines {
-                l.rect[0] += x as f32;
-                l.rect[1] += y as f32;
-            }
+            // a still screen is not read again (saves the GPU for the game)
+            let print = ocr::fingerprint(&px, w, h);
+            let lines = if ocr::same_frame(&print, &last_frame.0) {
+                last_frame.1.clone()
+            } else {
+                let mut lines = match &mut reader.as_mut().unwrap().1 {
+                    Reader::Paddle(p) => p.recognize(&px, w, h)?,
+                    Reader::Windows(e) => ocr::recognize(e, &px, w, h)?,
+                };
+                for l in &mut lines {
+                    l.rect[0] += x as f32;
+                    l.rect[1] += y as f32;
+                }
+                last_frame = (print, lines.clone());
+                lines
+            };
             let blocks = ocr::blocks(lines);
             let (choice, strong) = match ocr::find_choice(&blocks).filter(|_| cfg.choice_mode) {
                 Some((c, strong)) => (Some(c), strong),
@@ -287,9 +337,11 @@ fn worker(s: S, ctx: Context) {
                         // the vision model decides from the screenshot; without one, the layout + text gate decides
                         // (a plain menu never gets that far: unmarked short labels with no question are filtered first)
                         let plausible = strong || ocr::worth_asking(&options, &scene);
-                        let seen = (plausible && vision).then(|| llm::pick_choice_vision(&ocr::bmp_thumbnail(&px, w, h, 896), &options, &cfg.target_lang));
+                        // hybrid: vision says whether it is a choice (14/15), text reasons about the best option (5/7)
+                        let seen = (plausible && vision).then(|| llm::is_choice_vision(&ocr::bmp_thumbnail(&px, w, h, 896), &options));
                         let verdict = match seen {
-                            Some(Ok(v)) => v,
+                            Some(Ok(false)) => None,
+                            Some(Ok(true)) => llm::pick_choice(&options, &scene, &cfg.target_lang, false)?,
                             _ if plausible => llm::pick_choice(&options, &scene, &cfg.target_lang, !strong)?,
                             _ => None,
                         };
@@ -601,8 +653,10 @@ impl App {
             ui.label(RichText::new(format!("{} · {:.0} GB VRAM · {:.0} GB RAM", sp.gpu, sp.vram, sp.ram)).color(INK));
             ui.label(
                 RichText::new(format!(
-                    "While you play, the translator gets about {vram_budget:.1} GB VRAM and {ram_budget:.1} GB RAM (a quarter of each), \
-                     so the game keeps the rest. Only quantizations with small quality loss (Q4_K_M and better) are offered."
+                    "While you play, Paper Translate uses about a quarter of your VRAM and RAM, so the game keeps the rest: \
+                     {vram_budget:.1} GB VRAM and {ram_budget:.1} GB RAM for the model{}. Only quantizations with small quality loss \
+                     (Q4_K_M and better) are offered.",
+                    if sp.paddle_fits() { format!(", plus {:.2} GB for the PaddleOCR text reader", setup::PADDLE_VRAM) } else { ", text read by Windows OCR".into() }
                 ))
                 .size(12.0)
                 .color(MUTED),
@@ -695,7 +749,8 @@ impl App {
                 if go.clicked()
                     && let Some((url, file, mmproj)) = target
                 {
-                    run_setup(self.s.clone(), ui.ctx().clone(), url, Path::new(self.model_dir.trim()).join(file), mmproj);
+                    let paddle = self.specs.paddle_fits();
+                    run_setup(self.s.clone(), ui.ctx().clone(), url, Path::new(self.model_dir.trim()).join(file), mmproj, paddle);
                     self.wizard = false;
                 }
                 if self.draft.has_model() && ui.button("Cancel").clicked() {
@@ -744,25 +799,48 @@ impl App {
         });
         card(ui, a(2.0), |ui| {
             heading(ui, "Languages");
+            let paddle = self.draft.ocr_engine == "paddle";
             egui::Grid::new("langs").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-                ui.label("Read text in");
-                egui::ComboBox::from_id_salt("ocr").selected_text(&self.draft.ocr_lang).width(200.0).show_ui(ui, |ui| {
-                    for l in &self.langs {
-                        ui.selectable_value(&mut self.draft.ocr_lang, l.clone(), l);
-                    }
+                ui.label("Text reader");
+                let name = if paddle { "PaddleOCR v6 (accurate)" } else { "Windows OCR (lightest)" };
+                egui::ComboBox::from_id_salt("engine").selected_text(name).width(200.0).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.draft.ocr_engine, "paddle".into(), "PaddleOCR v6 (accurate)");
+                    ui.selectable_value(&mut self.draft.ocr_engine, "windows".into(), "Windows OCR (lightest)");
                 });
                 ui.end_row();
+                if !paddle {
+                    ui.label("Read text in");
+                    egui::ComboBox::from_id_salt("ocr").selected_text(&self.draft.ocr_lang).width(200.0).show_ui(ui, |ui| {
+                        for l in &self.langs {
+                            ui.selectable_value(&mut self.draft.ocr_lang, l.clone(), l);
+                        }
+                    });
+                    ui.end_row();
+                }
                 ui.label("Translate to");
                 ui.add(egui::TextEdit::singleline(&mut self.draft.target_lang).desired_width(200.0));
                 ui.end_row();
             });
             ui.label(RichText::new("Translate to accepts any language name, e.g. Thai, Japanese, English.").size(12.0).color(MUTED));
+            let reader = self.s.lock().unwrap().reader.clone();
+            if !reader.is_empty() {
+                ui.label(RichText::new(format!("Reading with {reader}")).size(12.0).color(MUTED));
+            }
+            let dir = setup::paddle_dir(&self.draft.model_path);
+            if paddle && !setup::paddle_ready(&dir) {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("PaddleOCR files are missing; Windows OCR is used until then.").size(12.0).color(MUTED));
+                    if ui.button("Download (139 MB)").clicked() {
+                        get_paddle(self.s.clone(), ui.ctx().clone(), dir);
+                    }
+                });
+            }
             // Windows only ships OCR for languages that are installed; offer the common game languages
             let missing: Vec<(&str, &str)> = [("ja-JP", "Japanese"), ("zh-CN", "Chinese"), ("ko-KR", "Korean")]
                 .into_iter()
                 .filter(|(tag, _)| !self.langs.iter().any(|l| l == tag))
                 .collect();
-            if !missing.is_empty() {
+            if !missing.is_empty() && !paddle {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new("Read games in").size(12.0).color(MUTED));
                     for (tag, name) in missing {

@@ -110,6 +110,9 @@ pub const MODELS: &[Model] = &[
     },
 ];
 
+/// PaddleOCR v6 medium on DirectML at 960 px, measured peak.
+pub const PADDLE_VRAM: f32 = 0.75;
+
 pub struct Specs {
     pub gpu: String,
     pub vram: f32,
@@ -141,9 +144,21 @@ impl Specs {
         Specs { gpu, vram, ram }
     }
 
-    /// What the translator may use while a game runs: a quarter of VRAM and of RAM, the rest stays with the game.
-    pub fn budget(&self) -> (f32, f32) {
+    /// A quarter of VRAM and of RAM is what Paper Translate may use while a game runs; the rest stays with the game.
+    fn share(&self) -> (f32, f32) {
         ((self.vram * 0.25).clamp(0.8, 8.0), (self.ram * 0.25).max(0.5))
+    }
+
+    /// PaddleOCR on the GPU needs ~0.75 GB; below a 2.5 GB share (GPUs under ~10 GB) the LLM needs it more, so those
+    /// PCs read text with Windows OCR instead.
+    pub fn paddle_fits(&self) -> bool {
+        self.share().0 >= 2.5
+    }
+
+    /// What the translation model may use: the share minus PaddleOCR's VRAM when it runs.
+    pub fn budget(&self) -> (f32, f32) {
+        let (v, r) = self.share();
+        (if self.paddle_fits() { v - PADDLE_VRAM } else { v }, r)
     }
 
     /// Highest-quality quant of `m` that fits the gaming budget, with its vision projector when that fits too.
@@ -201,6 +216,25 @@ pub fn download(url: &str, dest: &Path, mut progress: impl FnMut(u64, u64)) -> R
         return Err(format!("download interrupted ({done}/{total} bytes)"));
     }
     fs::rename(&part, dest).map_err(|e| e.to_string())
+}
+
+/// PaddleOCR model files live next to the translation model.
+pub fn paddle_dir(model_path: &str) -> PathBuf {
+    Path::new(model_path).parent().map(Path::to_path_buf).unwrap_or_else(app_dir)
+}
+
+pub fn paddle_ready(dir: &Path) -> bool {
+    crate::paddle::FILES.iter().all(|f| dir.join(f.2).is_file())
+}
+
+pub fn get_paddle(dir: &Path, mut progress: impl FnMut(u64, u64)) -> Result<(), String> {
+    fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    for (repo, file, local) in crate::paddle::FILES {
+        if !dir.join(local).is_file() {
+            download(&hf_url(repo, file), &dir.join(local), &mut progress)?;
+        }
+    }
+    Ok(())
 }
 
 pub fn find_llama_server(configured: &str) -> Option<PathBuf> {
@@ -303,11 +337,13 @@ fn custom_url_parsing() {
 fn picks_best_quant_for_the_budget() {
     let pc = |vram, ram| Specs { gpu: String::new(), vram, ram };
     let file = |f: Option<(&Quant, bool)>| f.map(|(q, v)| (q.file, v));
-    // 16 GB GPU / 32 GB RAM: 4 GB. E4B only fits without vision, E2B Q8_0 fits with it and is recommended
-    assert_eq!(file(pc(16.0, 32.0).fit(&MODELS[0])), Some(("gemma-4-E4B-it-Q5_K_M.gguf", false)));
-    assert_eq!(file(pc(16.0, 32.0).fit(&MODELS[1])), Some(("gemma-4-E2B-it-Q8_0.gguf", true)));
+    // 16 GB GPU / 32 GB RAM: 4 GB share, PaddleOCR takes 0.75 → E4B no longer fits, E2B Q5_K_M + vision does
+    assert!(pc(16.0, 32.0).paddle_fits());
+    assert!(pc(16.0, 32.0).fit(&MODELS[0]).is_none());
+    assert_eq!(file(pc(16.0, 32.0).fit(&MODELS[1])), Some(("gemma-4-E2B-it-Q5_K_M.gguf", true)));
     assert_eq!(pc(16.0, 32.0).recommend(), Some(1));
-    // 8 GB GPU / 16 GB RAM: 2 GB → no room for vision, E2B Q5_K_M text-only
+    // 8 GB GPU / 16 GB RAM: 2 GB share → Windows OCR, no room for vision, E2B Q5_K_M text-only
+    assert!(!pc(8.0, 16.0).paddle_fits());
     assert!(pc(8.0, 16.0).fit(&MODELS[0]).is_none());
     assert_eq!(file(pc(8.0, 16.0).fit(&MODELS[1])), Some(("gemma-4-E2B-it-Q5_K_M.gguf", false)));
     // 4 GB GPU: 1 GB → only the tiny model

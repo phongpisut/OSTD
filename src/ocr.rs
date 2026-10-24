@@ -93,15 +93,20 @@ pub fn recognize(engine: &OcrEngine, bgra: &[u8], w: i32, h: i32) -> Result<Vec<
                 (x1, y1) = (x1.max(r.X + r.Width), y1.max(r.Y + r.Height));
                 words.push(text);
             }
-            let text = join_words(&words);
-            // skip HUD numbers, single glyphs and lines that were all noise
-            if x0 < x1 && text.chars().filter(|c| c.is_alphabetic()).count() >= 2 {
+            if let Some(text) = clean_text(&words).filter(|_| x0 < x1) {
                 out.push(Line { text, rect: [x0, y0, x1 - x0, y1 - y0], line_h: y1 - y0 });
             }
         }
         Ok(out)
     };
     run().map_err(|e| e.to_string())
+}
+
+/// Drops icon-noise words and lines without real words (HUD numbers, single glyphs); None when nothing is left.
+pub fn clean_text(words: &[String]) -> Option<String> {
+    let kept: Vec<String> = words.iter().filter(|w| !junk_word(w)).cloned().collect();
+    let text = join_words(&kept);
+    (text.chars().filter(|c| c.is_alphabetic()).count() >= 2).then_some(text)
 }
 
 /// OCR of icons and textures gives tokens like "L8fi0WN" or "lIlI1"; real words don't put digits between
@@ -150,6 +155,22 @@ pub fn bmp_thumbnail(bgra: &[u8], w: i32, h: i32, max_w: i32) -> Vec<u8> {
     out
 }
 
+/// A 64x36 grayscale sample of the frame, to notice when nothing on screen changed.
+pub fn fingerprint(bgra: &[u8], w: i32, h: i32) -> Vec<u8> {
+    let (w, h) = (w as usize, h as usize);
+    (0..36 * 64)
+        .map(|i| {
+            let p = ((i / 64) * h / 36 * w + (i % 64) * w / 64) * 4;
+            ((bgra[p] as u32 + bgra[p + 1] as u32 * 2 + bgra[p + 2] as u32) / 4) as u8
+        })
+        .collect()
+}
+
+/// Same picture within an average of 2 gray levels (video noise, a blinking cursor).
+pub fn same_frame(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).map(|(x, y)| x.abs_diff(*y) as usize).sum::<usize>() < a.len() * 2
+}
+
 /// Japanese and Chinese are written without spaces.
 fn cjk(c: char) -> bool {
     matches!(c, '\u{3000}'..='\u{30FF}' | '\u{3400}'..='\u{9FFF}' | '\u{FF00}'..='\u{FFEF}')
@@ -188,30 +209,37 @@ pub fn marker(t: &str) -> bool {
     c.len() == 3 && (matches!(c[0], 'A'..='F' | 'a'..='f' | '1'..='9')) && matches!(c[1], '.' | ')' | ']' | ':') && c[2] == ' '
 }
 
-/// Merge stacked lines of one paragraph (dialogue boxes) so they are translated together.
+/// Merge stacked lines of one paragraph (dialogue boxes) so they are translated together. A line joins the block whose
+/// last line sits right above it, wherever that block is in the list: readers return lines column-wise (Windows) or
+/// row-wise across columns (PaddleOCR).
 pub fn blocks(lines: Vec<Line>) -> Vec<Line> {
-    let mut out: Vec<Line> = vec![];
-    let mut last = [0f32; 4];
+    let mut out: Vec<(Line, [f32; 4])> = vec![];
     for l in lines {
         let [x, y, w, h] = l.rect;
-        if let Some(b) = out.last_mut() {
+        let fits = |last: &[f32; 4]| {
             let gap = y - (last[1] + last[3]);
             let left = (x - last[0]).abs() < 2.0 * h;
             let centered = ((x + w / 2.0) - (last[0] + last[2] / 2.0)).abs() < 2.0 * h;
             let same_size = (0.7..1.4).contains(&(h / last[3]));
-            if gap > -0.3 * h && gap < 0.9 * h && (left || centered) && same_size && !marker(&l.text) {
+            // wrapped paragraphs never get much wider; a short speaker name above a long line is its own block
+            let continues = w <= last[2] * 1.3;
+            gap > -0.3 * h && gap < 0.9 * h && (left || centered) && same_size && continues
+        };
+        match out.iter_mut().rev().find(|(_, last)| fits(last)).filter(|_| !marker(&l.text)) {
+            Some((b, last)) => {
                 b.text = join_words(&[b.text.clone(), l.text]);
                 let (x0, y0) = (b.rect[0].min(x), b.rect[1].min(y));
                 let (x1, y1) = ((b.rect[0] + b.rect[2]).max(x + w), (b.rect[1] + b.rect[3]).max(y + h));
                 b.rect = [x0, y0, x1 - x0, y1 - y0];
-                last = l.rect;
-                continue;
+                *last = l.rect;
+            }
+            None => {
+                let r = l.rect;
+                out.push((l, r));
             }
         }
-        last = l.rect;
-        out.push(l);
     }
-    out
+    out.into_iter().map(|(b, _)| b).collect()
 }
 
 fn cx(b: &Line) -> f32 {
@@ -423,6 +451,33 @@ fn dialogue_choices_and_one_region() {
 }
 
 #[test]
+fn speaker_name_stays_separate() {
+    // PaddleOCR boxes for the Japanese scene: name in a bigger font right above the first line
+    let b = blocks(fixture(&[
+        ("長老ミラ", [311.0, 668.0, 120.0, 34.0]),
+        ("昨夜、ストームホールドから月光石の首飾りが盗まれた。", [310.0, 724.0, 760.0, 31.0]),
+        ("影のギルドが売れば、古い封印が壊れてしまう。", [310.0, 766.0, 640.0, 31.0]),
+    ]));
+    assert_eq!(b.len(), 2);
+    assert_eq!(b[1].text, "昨夜、ストームホールドから月光石の首飾りが盗まれた。影のギルドが売れば、古い封印が壊れてしまう。");
+}
+
+#[test]
+fn row_wise_cards_merge_the_same() {
+    // PaddleOCR order: all titles, then each description row across the three cards
+    let b = blocks(fixture(&[
+        ("Thunder Strike", [378.0, 496.0, 283.0, 27.0]),
+        ("Iron Skin", [873.0, 496.0, 174.0, 27.0]),
+        ("Your attacks chain lightning", [362.0, 572.0, 316.0, 25.0]),
+        ("Take 30% less damage", [831.0, 572.0, 257.0, 25.0]),
+        ("to 3 nearby enemies.", [400.0, 608.0, 239.0, 25.0]),
+        ("for 10 seconds after a dash.", [803.0, 608.0, 313.0, 19.0]),
+    ]));
+    let texts: Vec<&str> = b.iter().map(|l| l.text.as_str()).collect();
+    assert_eq!(texts, ["Thunder Strike", "Iron Skin", "Your attacks chain lightning to 3 nearby enemies.", "Take 30% less damage for 10 seconds after a dash."]);
+}
+
+#[test]
 fn reward_cards_are_one_choice() {
     let b = blocks(fixture(&[
         ("Thunder Strike", [378.0, 496.0, 283.0, 27.0]),
@@ -447,4 +502,26 @@ fn reward_cards_are_one_choice() {
     let regs = regions(&b, Some(&choice));
     assert_eq!(regs.len(), 2); // the title on its own, all three cards together
     assert!(regs.iter().any(|r| r.len() == 1 && b[r[0]].text == "Choose a Blessing"));
+}
+
+/// Benchmark dump: `SCENES=<dir> NAMES=a,b cargo test --release ocr_json -- --ignored` writes <dir>/win_ocr.json
+#[test]
+#[ignore]
+fn ocr_json() {
+    let dir = std::path::PathBuf::from(std::env::var("SCENES").unwrap());
+    let e = engine("en-US").unwrap();
+    let mut out = serde_json::Map::new();
+    for name in std::env::var("NAMES").unwrap().split(',') {
+        let px = std::fs::read(dir.join(format!("{name}.bgra"))).unwrap();
+        let mut best = f64::MAX;
+        let mut lines = vec![];
+        for _ in 0..5 {
+            let t = std::time::Instant::now();
+            lines = recognize(&e, &px, 1920, 1080).unwrap();
+            best = best.min(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        let texts: Vec<String> = lines.into_iter().map(|l| l.text).collect();
+        out.insert(name.into(), serde_json::json!({ "ms": best, "lines": texts }));
+    }
+    std::fs::write(dir.join("win_ocr.json"), serde_json::to_string_pretty(&out).unwrap()).unwrap();
 }
