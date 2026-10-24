@@ -1,0 +1,4 @@
+/target
+/target-next
+/dist
+*.wixpdb
