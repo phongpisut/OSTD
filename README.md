@@ -93,7 +93,7 @@ cargo build --release
 To build the installer with WiX 5 (`dotnet tool install --global wix --version 5.0.2`):
 
 ```bash
-wix build installer/PaperTranslate.wxs -d Version=0.1.0 -arch x64 -o dist/PaperTranslate-0.1.0-Setup.msi
+wix build installer/PaperTranslate.wxs -d Version=0.2.0 -arch x64 -o dist/PaperTranslate-0.2.0-Setup.msi
 ```
 
 ## Limits
