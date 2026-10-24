@@ -555,7 +555,7 @@ impl App {
         }));
 
         let specs = setup::Specs::detect();
-        let default_dir = std::env::var("LOCALAPPDATA").map(|d| format!("{d}\\PaperTranslate\\models")).unwrap_or_default();
+        let default_dir = setup::default_models_dir().display().to_string();
         let mut app = Self {
             s: s.clone(),
             _tray: tray,

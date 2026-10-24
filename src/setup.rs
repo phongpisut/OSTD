@@ -188,11 +188,31 @@ pub fn parse_custom_url(url: &str) -> Option<(String, String)> {
     (url.starts_with("https://huggingface.co/") && name.ends_with(".gguf")).then_some((url, name))
 }
 
+/// A folder next to the exe (portable: settings and downloads travel with it), or under `fallback` (an env var such as
+/// APPDATA) when the exe sits somewhere read-only like Program Files.
+fn portable(sub: &str, fallback: &str) -> PathBuf {
+    let beside = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join(sub)));
+    match beside.filter(|d| fs::create_dir_all(d).is_ok() && fs::write(d.join(".write-test"), b"").is_ok()) {
+        Some(d) => {
+            let _ = fs::remove_file(d.join(".write-test"));
+            d
+        }
+        None => {
+            let d = Path::new(&std::env::var(fallback).unwrap_or_else(|_| ".".into())).join("PaperTranslate").join(sub);
+            let _ = fs::create_dir_all(&d);
+            d
+        }
+    }
+}
+
+/// Settings, llama.cpp and logs: `data\` beside the exe.
 pub fn app_dir() -> PathBuf {
-    let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".into());
-    let dir = Path::new(&base).join("PaperTranslate");
-    let _ = fs::create_dir_all(&dir);
-    dir
+    portable("data", "APPDATA")
+}
+
+/// Where models go unless the player picks another folder: `models\` beside the exe.
+pub fn default_models_dir() -> PathBuf {
+    portable("models", "LOCALAPPDATA")
 }
 
 pub fn download(url: &str, dest: &Path, mut progress: impl FnMut(u64, u64)) -> Result<(), String> {

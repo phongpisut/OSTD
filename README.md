@@ -13,12 +13,20 @@ runs locally: PaddleOCR (or Windows OCR) reads the screen, and a small quantized
 
 ## Install
 
-Download `PaperTranslate-<version>-Setup.msi` from [Releases](https://github.com/phongpisut/OSTD/releases) and run it.
-It installs for your user only (no admin) and adds a Start Menu shortcut.
+Download `PaperTranslate-<version>-portable.zip` from [Releases](https://github.com/phongpisut/OSTD/releases), unzip it
+anywhere you can write to, and run `paper-translate.exe`. There is no installer and no admin prompt.
+
+Everything stays in that folder:
+- `data\`: settings, llama.cpp, logs
+- `models\`: downloaded models (another folder can be picked in the setup window)
+
+To move or back it up, copy the folder. To remove it, quit from the tray and delete the folder. If the folder is
+read-only (for example under Program Files), settings go to `%APPDATA%\PaperTranslate` and models to
+`%LOCALAPPDATA%\PaperTranslate` instead.
 
 On first launch, Paper Translate shows your GPU, VRAM and RAM, and recommends a model that fits beside a running game.
-It downloads the model, the vision module and PaddleOCR from Hugging Face into a folder you choose. If `llama-server` is
-not on `PATH`, it also installs the newest llama.cpp Vulkan build, which runs on NVIDIA, AMD and Intel.
+It downloads the model, the vision module and PaddleOCR from Hugging Face. If `llama-server` is not on `PATH`, it also
+installs the newest llama.cpp Vulkan build into `data\llama`, which runs on NVIDIA, AMD and Intel.
 
 After setup the app lives in the tray. Left-click the tray icon for Settings. The hotkey **Ctrl+Shift+T**
 (configurable) works like this:
@@ -116,10 +124,10 @@ plus 3 options is translated in ~1.2 s, and the choice decision adds ~1 s once p
 cargo build --release
 ```
 
-To build the installer with WiX 5 (`dotnet tool install --global wix --version 5.0.2`):
+To build the portable zip (`dist\PaperTranslate-<version>-portable.zip`):
 
 ```bash
-wix build installer/PaperTranslate.wxs -d Version=0.3.0 -arch x64 -o dist/PaperTranslate-0.3.0-Setup.msi
+powershell -File portable/package.ps1
 ```
 
 ## Limits
