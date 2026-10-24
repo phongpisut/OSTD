@@ -3184,7 +3184,7 @@ dependencies = [
 
 [[package]]
 name = "paper-translate"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "eframe",
  "global-hotkey",
