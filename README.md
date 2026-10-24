@@ -1,4 +1,4 @@
-# Paper Translate
+# OSTD
 
 Live on-screen translation overlay for Windows 11 games and apps. Press a hotkey and the text in the foreground
 window is covered by paper-style cards in your language. Names, items and key terms are highlighted in orange.
@@ -14,18 +14,18 @@ runs locally: PaddleOCR (or Windows OCR) reads the screen, and a small quantized
 
 ## Install
 
-Download `PaperTranslate-<version>-portable.zip` from [Releases](https://github.com/phongpisut/OSTD/releases), unzip it
-anywhere you can write to, and run `paper-translate.exe`. There is no installer and no admin prompt.
+Download `OSTD-<version>-portable.zip` from [Releases](https://github.com/phongpisut/OSTD/releases), unzip it
+anywhere you can write to, and run `ostd.exe`. There is no installer and no admin prompt.
 
 Everything stays in that folder:
 - `data\`: settings, llama.cpp, logs
 - `models\`: downloaded models (another folder can be picked in the setup window)
 
 To move or back it up, copy the folder. To remove it, quit from the tray and delete the folder. If the folder is
-read-only (for example under Program Files), settings go to `%APPDATA%\PaperTranslate` and models to
-`%LOCALAPPDATA%\PaperTranslate` instead.
+read-only (for example under Program Files), settings go to `%APPDATA%\OSTD` and models to
+`%LOCALAPPDATA%\OSTD` instead.
 
-On first launch, Paper Translate shows your GPU, VRAM and RAM, and recommends a model that fits beside a running game.
+On first launch, OSTD shows your GPU, VRAM and RAM, and recommends a model that fits beside a running game.
 It downloads the model, the vision module and PaddleOCR from Hugging Face. If `llama-server` is not on `PATH`, it also
 installs the newest llama.cpp Vulkan build into `data\llama`, which runs on NVIDIA, AMD and Intel.
 
@@ -106,7 +106,7 @@ directly.
 
 ## Models
 
-Paper Translate may use **a quarter of your VRAM and RAM** while you play. On GPUs with a share of at least 2.5 GB (about
+OSTD may use **a quarter of your VRAM and RAM** while you play. On GPUs with a share of at least 2.5 GB (about
 10 GB VRAM and up), PaddleOCR takes 0.75 GB of it. Smaller GPUs use Windows OCR so the model keeps the room. For each
 model the app picks the best quantization that fits (never below Q4_K_M), with the vision module when that fits too.
 
@@ -128,7 +128,7 @@ plus 3 options is translated in ~1.2 s, and the choice decision adds ~1 s once p
 cargo build --release
 ```
 
-To build the portable zip (`dist\PaperTranslate-<version>-portable.zip`):
+To build the portable zip (`dist\OSTD-<version>-portable.zip`):
 
 ```bash
 powershell -File portable/package.ps1

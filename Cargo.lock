@@ -3149,6 +3149,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "ostd"
+version = "0.3.1"
+dependencies = [
+ "eframe",
+ "global-hotkey",
+ "ort",
+ "rfd",
+ "serde",
+ "serde_json",
+ "tray-icon",
+ "ureq",
+ "windows",
+ "winresource",
+ "zip",
+]
+
+[[package]]
 name = "owned_ttf_parser"
 version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3180,23 +3197,6 @@ dependencies = [
  "gobject-sys",
  "libc",
  "system-deps",
-]
-
-[[package]]
-name = "paper-translate"
-version = "0.3.1"
-dependencies = [
- "eframe",
- "global-hotkey",
- "ort",
- "rfd",
- "serde",
- "serde_json",
- "tray-icon",
- "ureq",
- "windows",
- "winresource",
- "zip",
 ]
 
 [[package]]

@@ -182,7 +182,7 @@ fn base64_matches_rfc4648() {
 #[ignore]
 fn vision_e2e() {
     use crate::setup::*;
-    let dir = std::path::PathBuf::from(std::env::var("LOCALAPPDATA").unwrap()).join("PaperTranslate").join("models");
+    let dir = crate::setup::test_models();
     let exe = find_llama_server("").unwrap();
     let mut server = start_server(&exe, &dir.join("gemma-4-E2B-it-Q4_K_M.gguf"), Some(&dir.join("mmproj-gemma-4-E2B-F16.gguf"))).unwrap();
     let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
@@ -222,7 +222,7 @@ fn e2e() {
     use crate::setup::*;
     let exe = find_llama_server("").unwrap_or_else(|| install_llama(|_, _| {}).unwrap());
     let (m, q) = (&MODELS[1], MODELS[1].quants.last().unwrap());
-    let dir = std::path::PathBuf::from(std::env::var("LOCALAPPDATA").unwrap()).join("PaperTranslate").join("models");
+    let dir = crate::setup::test_models();
     std::fs::create_dir_all(&dir).unwrap();
     let model = dir.join(std::env::var("E2E_MODEL").unwrap_or(q.file.into()));
     if !model.is_file() {

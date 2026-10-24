@@ -29,7 +29,7 @@ const MUTED: Color32 = Color32::from_rgb(0x8A, 0x7A, 0x63);
 const ORANGE: Color32 = Color32::from_rgb(0xE8, 0x6A, 0x10);
 const ORANGE_SOFT: Color32 = Color32::from_rgb(0xFC, 0xE3, 0xC8);
 const MARKER: Color32 = Color32::from_rgba_premultiplied(0x55, 0x37, 0x14, 0x55); // orange highlighter, ~33%
-const OVERLAY_TITLE: &str = "PaperTranslateOverlay";
+const OVERLAY_TITLE: &str = "OSTDOverlay";
 
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
 #[serde(default)]
@@ -553,7 +553,7 @@ impl App {
         let _ = menu.append_items(&[&settings, &toggle, &suggest, &PredefinedMenuItem::separator(), &quit]);
         let tray = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
-            .with_tooltip("Paper Translate")
+            .with_tooltip("OSTD")
             .with_icon(tray_icon_image())
             .build()
             .expect("tray icon");
@@ -772,7 +772,7 @@ impl App {
                 ui.add_space((1.0 - a(0.0)) * 12.0);
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("●").color(ORANGE).size(22.0));
-                    ui.label(RichText::new("Paper Translate").size(24.0).strong().color(INK));
+                    ui.label(RichText::new("OSTD").size(24.0).strong().color(INK));
                 });
                 ui.label(RichText::new("Live on-screen translation for games and apps").color(MUTED));
                 ui.add_space(14.0);
@@ -793,7 +793,7 @@ impl App {
             ui.label(RichText::new(format!("{} · {:.0} GB VRAM · {:.0} GB RAM", sp.gpu, sp.vram, sp.ram)).color(INK));
             ui.label(
                 RichText::new(format!(
-                    "While you play, Paper Translate uses about a quarter of your VRAM and RAM, so the game keeps the rest: \
+                    "While you play, OSTD uses about a quarter of your VRAM and RAM, so the game keeps the rest: \
                      {vram_budget:.1} GB VRAM and {ram_budget:.1} GB RAM for the model{}. Only quantizations with small quality loss \
                      (Q4_K_M and better) are offered.",
                     if sp.paddle_fits() { format!(", plus {:.2} GB for the PaddleOCR text reader", setup::PADDLE_VRAM) } else { ", text read by Windows OCR".into() }
@@ -1110,7 +1110,7 @@ impl eframe::App for App {
             }
         };
         let builder = ViewportBuilder::default()
-            .with_title("Paper Translate")
+            .with_title("OSTD")
             .with_inner_size([540.0, 720.0])
             .with_min_inner_size([460.0, 400.0])
             .with_icon(Arc::new(egui::IconData { rgba: icon_rgba(64), width: 64, height: 64 }));

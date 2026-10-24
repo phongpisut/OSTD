@@ -223,7 +223,7 @@ pub fn install_language(tag: &str) {
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
     let args = format!(
-        "-NoProfile -Command \"Add-WindowsCapability -Online -Name 'Language.OCR~~~{tag}~0.0.1.0'; Write-Host 'Done, click Refresh in Paper Translate.'; Start-Sleep 3\""
+        "-NoProfile -Command \"Add-WindowsCapability -Online -Name 'Language.OCR~~~{tag}~0.0.1.0'; Write-Host 'Done, click Refresh in OSTD.'; Start-Sleep 3\""
     );
     unsafe {
         ShellExecuteW(None, &HSTRING::from("runas"), &HSTRING::from("powershell.exe"), &HSTRING::from(args), None, SW_SHOWNORMAL);

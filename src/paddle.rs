@@ -295,11 +295,11 @@ fn dict_parsing() {
     assert_eq!(read_dict(yml), ["!", "\"", "'", "a", "あ"]);
 }
 
-/// `SCENES=<dir> cargo test --release paddle_bench -- --ignored --nocapture` (needs the model files in %LOCALAPPDATA%\PaperTranslate\models)
+/// `SCENES=<dir> cargo test --release paddle_bench -- --ignored --nocapture` (model files from setup::test_models)
 #[test]
 #[ignore]
 fn paddle_bench() {
-    let models = std::path::PathBuf::from(std::env::var("LOCALAPPDATA").unwrap()).join("PaperTranslate").join("models");
+    let models = crate::setup::test_models();
     let mut p = Paddle::load(&models).unwrap();
     println!("gpu: {}", p.gpu);
     let dir = std::path::PathBuf::from(std::env::var("SCENES").unwrap());
@@ -326,7 +326,7 @@ fn paddle_bench() {
 #[test]
 #[ignore]
 fn paddle_scripts() {
-    let models = std::path::PathBuf::from(std::env::var("LOCALAPPDATA").unwrap()).join("PaperTranslate").join("models");
+    let models = crate::setup::test_models();
     let mut p = Paddle::load(&models).unwrap();
     let dir = std::path::PathBuf::from(std::env::var("SCENES").unwrap());
     for name in ["korean", "russian", "thai_src"] {

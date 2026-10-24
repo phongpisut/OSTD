@@ -144,7 +144,7 @@ impl Specs {
         Specs { gpu, vram, ram }
     }
 
-    /// A quarter of VRAM and of RAM is what Paper Translate may use while a game runs; the rest stays with the game.
+    /// A quarter of VRAM and of RAM is what OSTD may use while a game runs; the rest stays with the game.
     fn share(&self) -> (f32, f32) {
         ((self.vram * 0.25).clamp(0.8, 8.0), (self.ram * 0.25).max(0.5))
     }
@@ -198,7 +198,7 @@ fn portable(sub: &str, fallback: &str) -> PathBuf {
             d
         }
         None => {
-            let d = Path::new(&std::env::var(fallback).unwrap_or_else(|_| ".".into())).join("PaperTranslate").join(sub);
+            let d = Path::new(&std::env::var(fallback).unwrap_or_else(|_| ".".into())).join("OSTD").join(sub);
             let _ = fs::create_dir_all(&d);
             d
         }
@@ -216,7 +216,7 @@ pub fn default_models_dir() -> PathBuf {
 }
 
 pub fn download(url: &str, dest: &Path, mut progress: impl FnMut(u64, u64)) -> Result<(), String> {
-    let resp = ureq::get(url).header("User-Agent", "paper-translate").call().map_err(|e| format!("{url}: {e}"))?;
+    let resp = ureq::get(url).header("User-Agent", "ostd").call().map_err(|e| format!("{url}: {e}"))?;
     let total = resp.headers().get("content-length").and_then(|v| v.to_str().ok()?.parse().ok()).unwrap_or(0);
     let part = dest.with_extension("part");
     let mut out = File::create(&part).map_err(|e| e.to_string())?;
@@ -257,6 +257,14 @@ pub fn get_paddle(dir: &Path, mut progress: impl FnMut(u64, u64)) -> Result<(), 
     Ok(())
 }
 
+/// Models for the real-model tests: OSTD_MODELS, else the folder development downloaded them to.
+#[cfg(test)]
+pub fn test_models() -> PathBuf {
+    std::env::var_os("OSTD_MODELS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(&std::env::var("LOCALAPPDATA").unwrap()).join("PaperTranslate").join("models"))
+}
+
 pub fn find_llama_server(configured: &str) -> Option<PathBuf> {
     let p = PathBuf::from(configured);
     if !configured.is_empty() && p.is_file() {
@@ -276,7 +284,7 @@ pub fn install_llama(progress: impl FnMut(u64, u64)) -> Result<PathBuf, String> 
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     // "latest" can point at a non-binary tag, so scan recent releases for the asset.
     let releases: serde_json::Value = ureq::get("https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=10")
-        .header("User-Agent", "paper-translate")
+        .header("User-Agent", "ostd")
         .call()
         .and_then(|r| r.into_body().read_json())
         .map_err(|e| format!("GitHub: {e}"))?;
